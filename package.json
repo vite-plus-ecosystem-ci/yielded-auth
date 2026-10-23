@@ -49,6 +49,8 @@
     "alchemy": "catalog:",
     "effect": "catalog:",
     "esbuild": "catalog:",
+    "oxfmt": "0.74.0",
+    "oxlint": "1.89.0",
     "react": "catalog:",
     "react-dom": "catalog:",
     "typescript": "catalog:",
