@@ -49,8 +49,8 @@
     "alchemy": "catalog:",
     "effect": "catalog:",
     "esbuild": "catalog:",
-    "oxfmt": "0.72.0",
-    "oxlint": "1.87.0",
+    "oxfmt": "0.74.0",
+    "oxlint": "1.89.0",
     "react": "catalog:",
     "react-dom": "catalog:",
     "typescript": "catalog:",
@@ -59,6 +59,7 @@
     "vite-plus": "catalog:"
   },
   "overrides": {
+    "vite": "catalog:",
     "vitest": "catalog:"
   },
   "engines": {
@@ -76,9 +77,9 @@
     "esbuild": "0.28.1",
     "typescript": "7.0.2",
     "typescript-twoslash": "npm:typescript@6.0.3",
-    "vite": "npm:@voidzero-dev/vite-plus-core@1.1.0",
-    "vite-plus": "1.1.0",
-    "vitest": "5.0.3",
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.0.0-commit.6bc2d240a024170c08fbc831f0c201c162afd22e",
+    "vite-plus": "0.0.0-commit.6bc2d240a024170c08fbc831f0c201c162afd22e",
+    "vitest": "5.0.5",
     "@effect/sql-d1": "4.0.5",
     "@effect/sql-libsql": "4.0.5",
     "@effect/sql-mysql2": "4.0.5",
