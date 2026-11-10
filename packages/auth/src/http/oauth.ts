@@ -9,7 +9,7 @@ import { OperationHttpConfigurationError, OperationHttpError } from "../http-ope
 import { OperationHttpServerConfig } from "../http-operation/OperationHttpServerConfig";
 import { oauthCallback, type OAuthHttpCallback } from "../http-operation/server";
 import { origin as Origin } from "../internal/origin";
-import { selectCallback } from "../oauth/callback";
+import { providerCallbackParameters, selectCallback } from "../oauth/callback";
 import { OAuthConnectedProtocol } from "../oauth/OAuthConnectedProtocol";
 import { OAuthProtocol } from "../oauth/OAuthProtocol";
 import type { ProviderDefinition } from "../oauth/providerDefinition";
@@ -128,6 +128,10 @@ export const makeOAuth = <E, R, ResponseR>(
             ids.add(callbackId);
             captured.push({
               ...callback,
+              allowedQueryParameters: [
+                ...providerCallbackParameters,
+                ...(callback.allowedQueryParameters ?? []),
+              ],
               path,
               callbackId,
               redirectUri: yield* Schema.decodeResult(OAuthRedirectUri)(`${origin}${path}`),
