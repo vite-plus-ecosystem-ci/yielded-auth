@@ -117,9 +117,8 @@ export type SessionRequirements<C, Id extends string, Claims extends Schema.Top>
       : Mac.Mac)
   | Exclude<Claims["DecodingServices"] | Claims["EncodingServices"], Scope.Scope>
   | (C extends StatefulConfiguration<Duration.Input | undefined>
-      ?
-          | ModuleService<Id, "persistence", Claims["Type"]>
-          | ModuleService<Id, "repository", Claims["Type"]>
+      ? | ModuleService<Id, "persistence", Claims["Type"]>
+        | ModuleService<Id, "repository", Claims["Type"]>
       : C extends StateAssistedConfiguration
         ? ModuleService<Id, "validity", Claims["Type"]>
         : never);

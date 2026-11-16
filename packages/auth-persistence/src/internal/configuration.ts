@@ -224,9 +224,8 @@ type UsesProofs<A extends { readonly strategies: Readonly<Record<string, Strateg
 export type Ports<C extends ClaimsCodec, Id extends string, A extends Definition<C, Id>> =
   | AuthenticationAuthority
   | ("stateful" extends A["sessionMode"]
-      ?
-          | KeyId<A["sessions"]["StatefulSessionPersistence"]>
-          | KeyId<A["sessions"]["SessionRepository"]>
+      ? | KeyId<A["sessions"]["StatefulSessionPersistence"]>
+        | KeyId<A["sessions"]["SessionRepository"]>
       : never)
   | KeyId<A["sessions"]["PendingAuthentication"]>
   | KeyId<A["sessions"]["SessionStepUpPersistence"]>
