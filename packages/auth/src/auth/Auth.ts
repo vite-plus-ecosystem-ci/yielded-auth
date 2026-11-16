@@ -314,14 +314,12 @@ const bind = <
   type SelectedStrategies = (typeof selected)[keyof typeof selected];
   type Completes = true extends CompletionOf<SelectedStrategies> ? true : false;
   type ConfigurationRequirements = Sessions extends SessionConfiguration
-    ?
-        | SessionRequirements<Sessions, SessionId, Claims>
-        | (Completes extends true ? AuthenticationAuthority : never)
+    ? | SessionRequirements<Sessions, SessionId, Claims>
+      | (Completes extends true ? AuthenticationAuthority : never)
     : never;
   type Provided = Sessions extends SessionConfiguration
-    ?
-        | ModuleService<SessionId, "strategy", Claims["Type"]>
-        | (Completes extends true ? ModuleService<SessionId, "completion", Claims["Type"]> : never)
+    ? | ModuleService<SessionId, "strategy", Claims["Type"]>
+      | (Completes extends true ? ModuleService<SessionId, "completion", Claims["Type"]> : never)
     : never;
 
   // Runtime selection mirrors the session mode and presence of selected methods.

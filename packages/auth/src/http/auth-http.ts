@@ -808,18 +808,17 @@ export const make = <
       ReturnType<Effect.Success<ReturnType<typeof makeServer>>["handle"]>
     >;
     type Requirements<E extends HttpApiEndpoint.Constraint> = E extends HttpApiEndpoint.Constraint
-      ?
-          | HttpApiEndpoint.Middleware<E>
-          | HttpApiEndpoint.MiddlewareServices<E>
-          | HttpRouter.Request.From<
-              "Requires",
-              HttpApiEndpoint.ExcludeProvided<
-                E,
-                | InvocationServices
-                | HttpApiEndpoint.ServerServices<E>
-                | HttpServerRequest.HttpServerRequest
-              >
+      ? | HttpApiEndpoint.Middleware<E>
+        | HttpApiEndpoint.MiddlewareServices<E>
+        | HttpRouter.Request.From<
+            "Requires",
+            HttpApiEndpoint.ExcludeProvided<
+              E,
+              | InvocationServices
+              | HttpApiEndpoint.ServerServices<E>
+              | HttpServerRequest.HttpServerRequest
             >
+          >
       : never;
 
     return HttpApiBuilder.group(
