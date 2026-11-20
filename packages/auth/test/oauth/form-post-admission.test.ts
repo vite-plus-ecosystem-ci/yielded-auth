@@ -158,8 +158,16 @@ const callback = {
   flowId,
   provider,
   callbackId,
-  response: { _tag: "Error" as const, error: "access-denied" as const, state },
+  response: {
+    _tag: "Error" as const,
+    error: "access-denied" as const,
+    state,
+  },
 };
+
+const formPostTransport = Effect.provideService(OAuth.OAuthCallbackTransport, {
+  mode: "form_post",
+});
 
 const guest = Operations.guest;
 
@@ -171,6 +179,7 @@ const collector = Effect.provideService(
 interface SeenAccess {
   readonly formPostSubject: boolean;
   readonly subjectId: string | undefined;
+  readonly responseMode: "query" | "form_post" | undefined;
 }
 
 const linkPolicy = {
@@ -217,9 +226,11 @@ it.effect("admits a form_post account link that has only the binding cookie", ()
               seen.push({
                 formPostSubject: access.formPostSubject === true,
                 subjectId: access.subjectId,
+                responseMode: access.responseMode,
               });
 
-              if (access.formPostSubject !== true) return prepare({ _tag: "Rejected" }, journal);
+              if (access.formPostSubject !== true || access.responseMode !== "form_post")
+                return prepare({ _tag: "Rejected" }, journal);
 
               return prepare(
                 {
@@ -278,13 +289,15 @@ it.effect("admits a form_post account link that has only the binding cookie", ()
     const result = yield* accounts.operations.Link.Complete.invoke(guest, {
       ...callback,
       requestBinding: Redacted.value(command.credential),
-    }).pipe(collector, Effect.provide(handlers), Effect.result);
+    }).pipe(formPostTransport, collector, Effect.provide(handlers), Effect.result);
 
     expect(result).toMatchObject({
       _tag: "Success",
       success: { _tag: "Cancelled", returnTarget: "/" },
     });
-    expect(seen).toEqual([{ formPostSubject: true, subjectId: undefined }]);
+    expect(seen).toEqual([
+      { formPostSubject: true, subjectId: undefined, responseMode: "form_post" },
+    ]);
   }),
 );
 
@@ -330,9 +343,11 @@ it.effect("admits a form_post connected flow that has only the binding cookie", 
               seen.push({
                 formPostSubject: access.formPostSubject === true,
                 subjectId: access.subjectId,
+                responseMode: access.responseMode,
               });
 
-              if (access.formPostSubject !== true) return prepare({ _tag: "Rejected" }, journal);
+              if (access.formPostSubject !== true || access.responseMode !== "form_post")
+                return prepare({ _tag: "Rejected" }, journal);
 
               return prepare(
                 {
@@ -397,14 +412,21 @@ it.effect("admits a form_post connected flow that has only the binding cookie", 
 
     const result = yield* connected.operations.Complete.invoke(guest, {
       ...callback,
+      response: {
+        _tag: "Error" as const,
+        error: "rejected" as const,
+        state,
+      },
       requestBinding: Redacted.value(command.credential),
-    }).pipe(collector, Effect.provide(handlers), Effect.result);
+    }).pipe(formPostTransport, collector, Effect.provide(handlers), Effect.result);
 
     expect(result).toMatchObject({
       _tag: "Success",
       success: { _tag: "Cancelled", returnTarget: "/" },
     });
-    expect(seen).toEqual([{ formPostSubject: true, subjectId: undefined }]);
+    expect(seen).toEqual([
+      { formPostSubject: true, subjectId: undefined, responseMode: "form_post" },
+    ]);
   }),
 );
 
@@ -426,6 +448,7 @@ it.effect("rejects an unbound guest before consuming a form_post link", () =>
               seen.push({
                 formPostSubject: access.formPostSubject === true,
                 subjectId: access.subjectId,
+                responseMode: access.responseMode,
               });
 
               return prepare({ _tag: "Rejected" }, journal);
@@ -451,9 +474,20 @@ it.effect("rejects an unbound guest before consuming a form_post link", () =>
     const result = yield* accounts.operations.Link.Complete.invoke(guest, {
       ...callback,
       requestBinding: "unbound",
-    }).pipe(collector, Effect.provide(handlers), Effect.result);
+    }).pipe(formPostTransport, collector, Effect.provide(handlers), Effect.result);
 
     expect(result).toMatchObject({ _tag: "Failure", failure: { _tag: "OAuthRejected" } });
+
+    const queryResult = yield* accounts.operations.Link.Complete.invoke(guest, {
+      ...callback,
+      response: { _tag: "Error" as const, error: "access-denied" as const, state },
+      requestBinding: "unbound",
+    }).pipe(collector, Effect.provide(handlers), Effect.result);
+
+    expect(queryResult).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "AuthenticationRequired" },
+    });
     expect(seen).toEqual([]);
   }),
 );

@@ -1,3 +1,4 @@
+import * as OAuthProtocolClient from "@yielded/oauth/OAuth";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
@@ -6,6 +7,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Base64Url from "effect/encoding/Base64Url";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -67,6 +69,7 @@ import {
 } from "./signInErrors";
 import {
   OAuthCallbackResponse,
+  OAuthCallbackTransport,
   OAuthConsumeDecision,
   OAuthNativeCallbackId,
   OAuthNativeProtocolConfiguration,
@@ -662,6 +665,7 @@ export const makeOAuthMethod = <
             generation: policy.generation,
             flowId: request.flowId,
             ...prepared.configuration,
+            responseMode: prepared.responseMode ?? "query",
             ...(access === undefined ? {} : { access: access.profile }),
             returnTarget: canonicalTarget,
             stateDigest: yield* stateDigest(
@@ -873,6 +877,11 @@ export const makeOAuthMethod = <
             const request = yield* snapshotOAuthSignInComplete.effect(raw);
             const response = request.response;
 
+            const observedMode = Option.match(yield* Effect.serviceOption(OAuthCallbackTransport), {
+              onNone: () => "query" as const,
+              onSome: (transport) => transport.mode,
+            });
+
             const serialized = yield* Schema.encodeEffect(responseJson)(response).pipe(
               Effect.mapError(() => OAuthRejected.make({})),
             );
@@ -897,6 +906,7 @@ export const makeOAuthMethod = <
                 stateDigest: state,
                 requestBindingVerifier: binder.verifier,
                 requestBindingExpiresAtMillis: binder.expiresAtMillis,
+                responseMode: observedMode,
                 ...(response.issuer === undefined ? {} : { responseIssuer: response.issuer }),
               },
               (value, journal) => journal.prepare(snapshotOAuthConsumeDecision.sync(value)),
@@ -905,6 +915,7 @@ export const makeOAuthMethod = <
             if (decision._tag !== "Consumed") return yield* OAuthRejected.make({});
             const flow = yield* snapshotOAuthSignInFlow.effect(decision.flow);
             const context = flow.context;
+            const expectedMode = context.responseMode;
 
             if (
               context.moduleId !== id ||
@@ -916,6 +927,7 @@ export const makeOAuthMethod = <
               context.requestBindingVerifier !== binder.verifier ||
               context.requestBindingExpiresAtMillis !== binder.expiresAtMillis ||
               context.expiresAtMillis > context.requestBindingExpiresAtMillis ||
+              expectedMode !== observedMode ||
               (context.responseIssuerMode === "required"
                 ? response.issuer !== context.issuer
                 : response.issuer !== undefined)
@@ -944,10 +956,29 @@ export const makeOAuthMethod = <
                 if (
                   (context.protocol === "oidc") !== (secrets.oidcNonce !== undefined) ||
                   (yield* stateDigest(context.flowId, context.provider, secrets.state)) !==
-                    context.stateDigest ||
-                  Redacted.value(secrets.state) !== Redacted.value(response.state)
+                    context.stateDigest
                 )
                   return yield* OAuthUnavailable.make({});
+
+                yield* OAuthProtocolClient.validateCallback(
+                  {
+                    mode: observedMode,
+                    state: response.state,
+                    ...(response.issuer === undefined ? {} : { issuer: response.issuer }),
+                    outcome: {
+                      _tag: "Code",
+                      code: response.code,
+                      ...(response.scope === undefined ? {} : { scope: response.scope }),
+                      extra: {},
+                    },
+                  },
+                  {
+                    state: secrets.state,
+                    responseMode: expectedMode,
+                    issuer: context.issuer,
+                    issuerIdentification: context.responseIssuerMode,
+                  },
+                ).pipe(Effect.mapError(() => OAuthUnavailable.make({})));
 
                 const exchangeInput = {
                   configuration: yield* snapshotOAuthProtocolConfiguration.effect({
@@ -1042,6 +1073,7 @@ export const makeOAuthMethod = <
               context.provider !== request.provider ||
               context.callbackId !== OAuthNativeCallbackId ||
               context.redirectUri !== undefined ||
+              context.responseMode !== undefined ||
               context.protocol !== "oidc" ||
               context.responseIssuerMode !== "unsupported" ||
               context.access !== undefined ||
