@@ -1,3 +1,4 @@
+import * as ClientAuth from "@yielded/oauth/ClientAuth";
 import * as OAuthError from "@yielded/oauth/OAuthError";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -30,9 +31,9 @@ const Claims = Schema.Struct({
   exp: Schema.Finite,
 });
 
-const clientAuthFailed = (description: string, cause?: unknown): OAuthError.OAuthError =>
+const clientAuthFailed = (description: string): OAuthError.OAuthError =>
   new OAuthError.OAuthError({
-    reason: new OAuthError.ClientAuthFailed({ description, cause }),
+    reason: new OAuthError.ClientAuthFailed({ description }),
   });
 
 /** Sign one ES256 client-secret JWT with an opaque Effect signing key. */
@@ -147,3 +148,29 @@ export class PrivateKeyClientSecret extends Context.Service<
 
   static readonly layer = Layer.effect(PrivateKeyClientSecret, PrivateKeyClientSecret.make);
 }
+
+/** Wrap a per-request private-key JWT signer (such as Apple `.p8`) as a named
+ * `client_secret_post` `ClientAuth.Method`, keeping minting and application
+ * interruptible and wiping the minted secret on every exit. */
+export const makePrivateKeyClientAuth = (
+  authentication: Extract<OpenIdConnectAuthentication, { readonly privateKeyJwt: PrivateKeyJwt }>,
+  clientSecrets: PrivateKeyClientSecret["Service"],
+): ClientAuth.Method<never> =>
+  ClientAuth.make("client_secret_post", (request) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.flatMap(
+        restore(
+          clientSecrets.mint(authentication).pipe(
+            Effect.filterOrFail(
+              (secret): secret is Redacted.Redacted<string> => secret !== undefined,
+              () => clientAuthFailed("Missing client secret for private-key JWT"),
+            ),
+          ),
+        ),
+        (secret) =>
+          restore(ClientAuth.secretPost(secret).apply(request)).pipe(
+            Effect.ensuring(Effect.sync(() => Redacted.wipeUnsafe(secret))),
+          ),
+      ),
+    ),
+  );

@@ -542,11 +542,11 @@ your own atomic import; the key alone does not create login authority. See the
 
 `Http` derives `/auth/{provider}/callback` from the origin and contract base path.
 Callbacks use HTTPS, with HTTP loopback support for local development.
-Auth provider configuration requires HTTPS endpoints. The lower-level `@yielded/oauth` package provides `Discovery` (`makeLocal`/`layerLocal`
-and lazy, scoped `makeRemote`/`layerRemote`), `OAuthError` with a closed `reason` union,
-`Pkce` (`generate`/`challenge`), and generic form-encoded OAuth token/revocation requests
-with space-separated scopes (plain-OAuth profile fetches, JSON token bodies, and
-comma-separated scopes live in `@yielded/auth`'s provider adapters). It accepts HTTP
+Auth provider configuration requires HTTPS endpoints. The lower-level `@yielded/oauth` package
+exposes `ClientAuth`, `Discovery`, `Grant`, `OAuth`, `Oidc`, `Pkce`, and `OAuthError` for direct
+relying-party protocol composition (plain-OAuth profile fetches, JSON token bodies, and
+comma-separated scopes live in `@yielded/auth`'s provider adapters). Authorization URLs omit
+`response_mode` for `"query"` and emit `response_mode=form_post` only for `"form_post"`. It accepts HTTP
 endpoints and discovery URLs on
 `localhost`, `127.0.0.1`, or `[::1]` only with an explicitly configured HTTP loopback
 issuer. Asymmetric OIDC verification still requires an HTTPS JWKS URL.
