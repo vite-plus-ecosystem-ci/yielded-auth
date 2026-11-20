@@ -8,6 +8,22 @@ Use `vp help` and command help for options.
 Run `vp install` to install dependencies and configure Git hooks.
 Run `vp run ready` before handoff.
 
+Vite+ reads the Bun version from the root `packageManager` field. If
+`vp env doctor bun` reports system-first mode, enable managed Bun with
+`vp env on bun` so Vite+ uses the pin. Direct `bun` commands also need the Vite+
+shim ahead of system Bun on `PATH`. See
+[Vite+ environment modes](https://viteplus.dev/guide/env#environment-modes).
+
+In a sandbox, pass a writable `TMPDIR` to `vp` so Bun and the tests can create
+temporary files. For cached commands that use the OS temp directory, pass
+`TMPDIR` through the task's `cache.untrackedEnv`. The workspace `run.cache`
+settings control cache enablement. See
+[Vite Task configuration](https://viteplus.dev/config/run#cache-untrackedenv).
+
+Bun can also fall back to `.tmp` inside its install cache. Set
+`BUN_INSTALL_CACHE_DIR` in the sandbox environment if the default cache is
+read-only.
+
 `vp check` runs formatting and linting. `vp run check` also runs TypeScript and
 Effect diagnostics through `effect-tsrs` across workspaces and scripts. Its bundled
 tsrs compiler checks both with `--type-check`; `--strict` makes warnings fail the check.
