@@ -698,18 +698,41 @@ it.live("owns GitHub cohort revocation until its provider scope closes", () =>
 );
 
 const entraHost = "https://login.microsoftonline.com";
+const entraV1Host = "https://sts.windows.net";
+const ciamHost = "https://contoso.ciamlogin.com";
+const genericTenantHost = "https://idp.example";
 const entraTemplate = `${entraHost}/{tenantid}/v2.0`;
 const workTenant = "11111111-1111-1111-1111-111111111111";
+const otherWorkTenant = "22222222-2222-2222-2222-222222222222";
 const personalTenant = "9188040d-6c67-4c5b-b112-36a304b66dad";
 const uppercasePersonalTenant = personalTenant.toUpperCase();
 
-it.effect.each([
+interface EntraDiscoveryCase {
+  readonly name: string;
+  readonly host: string;
+  readonly authority: string;
+  readonly v1?: boolean;
+  readonly discoveryIssuer: string;
+  readonly tokenIssuer: string;
+  readonly tid: string;
+  readonly expectedSubject: string;
+  readonly keys: ReadonlyArray<{
+    readonly keyIssuer: string | undefined;
+    readonly tid?: string;
+    readonly accepted: boolean;
+  }>;
+}
+
+it.effect.each<EntraDiscoveryCase>([
   // Regression at 25217c71: pinning a discovery template admitted an issuer-less key.
   {
     name: "requires key issuer authority for a pinned tenant template",
+    host: entraHost,
     authority: workTenant,
     discoveryIssuer: entraTemplate,
-    tenant: workTenant,
+    tokenIssuer: `${entraHost}/${workTenant}/v2.0`,
+    tid: workTenant,
+    expectedSubject: "provider-subject",
     keys: [
       { keyIssuer: undefined, accepted: false },
       { keyIssuer: entraTemplate, accepted: true },
@@ -718,141 +741,277 @@ it.effect.each([
   // Regression at 881f94d: organizations admitted a personal account after template matching.
   {
     name: "definitely rejects personal accounts on organizations",
+    host: entraHost,
     authority: "organizations",
     discoveryIssuer: entraTemplate,
-    tenant: uppercasePersonalTenant,
+    tokenIssuer: `${entraHost}/${uppercasePersonalTenant}/v2.0`,
+    tid: uppercasePersonalTenant,
+    expectedSubject: `${personalTenant}:provider-subject`,
     keys: [{ keyIssuer: `${entraHost}/${uppercasePersonalTenant}/v2.0`, accepted: false }],
   },
   // Regression at 881f94d: concrete consumers discovery admitted an issuer-less key.
   {
     name: "requires key issuer authority for concrete consumers discovery",
+    host: entraHost,
     authority: "consumers",
     discoveryIssuer: `${entraHost}/${personalTenant}/v2.0`,
-    tenant: personalTenant,
-    keys: [{ keyIssuer: undefined, accepted: false }],
+    tokenIssuer: `${entraHost}/${personalTenant}/v2.0`,
+    tid: personalTenant,
+    expectedSubject: `${personalTenant}:provider-subject`,
+    keys: [
+      { keyIssuer: undefined, accepted: false },
+      { keyIssuer: `${entraHost}/${personalTenant}/v2.0`, accepted: true },
+      {
+        keyIssuer: `${entraHost}/${personalTenant}/v2.0`,
+        tid: uppercasePersonalTenant,
+        accepted: true,
+      },
+    ],
   },
-])("Entra discovery $name", ({ authority, discoveryIssuer, tenant, keys }) =>
-  Effect.gen(function* () {
-    const seconds = 2_000_000_000;
+  // Regression at 881f94d (carried into 0609a81): pinned consumers with a concrete
+  // JWK issuer never compared signed tid with the pinned tenant GUID before
+  // building the tenant-namespaced subject.
+  {
+    name: "rejects mismatched tid on pinned consumers discovery",
+    host: entraHost,
+    authority: "consumers",
+    discoveryIssuer: `${entraHost}/${personalTenant}/v2.0`,
+    tokenIssuer: `${entraHost}/${personalTenant}/v2.0`,
+    tid: workTenant,
+    expectedSubject: `${workTenant}:provider-subject`,
+    keys: [{ keyIssuer: `${entraHost}/${personalTenant}/v2.0`, accepted: false }],
+  },
+  // Regression at 881f94d (carried into 0609a81): pinned single-tenant GUID with
+  // a concrete JWK issuer never compared signed tid with the pinned tenant GUID.
+  {
+    name: "rejects mismatched tid on pinned single-tenant discovery",
+    host: entraHost,
+    authority: workTenant,
+    discoveryIssuer: entraTemplate,
+    tokenIssuer: `${entraHost}/${workTenant}/v2.0`,
+    tid: otherWorkTenant,
+    expectedSubject: "provider-subject",
+    keys: [{ keyIssuer: `${entraHost}/${workTenant}/v2.0`, accepted: false }],
+  },
+  // Regression at 881f94d (still open on ba2baeb): exact-match concrete Entra
+  // authorities (including Microsoft.provider({ tenant: "consumers" }), which
+  // rewrites consumers to the personal-account GUID before discovery) returned
+  // pinned: false with no expectedTenantId, admitting issuer-less keys and forged tid.
+  {
+    name: "pins exact-match concrete Entra personal-account authority and checks tid case-insensitively",
+    host: entraHost,
+    authority: personalTenant,
+    discoveryIssuer: `${entraHost}/${personalTenant}/v2.0`,
+    tokenIssuer: `${entraHost}/${personalTenant}/v2.0`,
+    tid: uppercasePersonalTenant,
+    expectedSubject: "provider-subject",
+    keys: [
+      { keyIssuer: undefined, accepted: false },
+      { keyIssuer: `${entraHost}/${personalTenant}/v2.0`, tid: workTenant, accepted: false },
+      { keyIssuer: `${entraHost}/${personalTenant}/v2.0`, accepted: true },
+    ],
+  },
+  // Regression at 881f94d (still open on ba2baeb): exact-match Entra External ID
+  // (*.ciamlogin.com) concrete tenant authorities must also pin key authority and tid.
+  {
+    name: "pins exact-match CIAM concrete tenant authority",
+    host: ciamHost,
+    authority: workTenant,
+    discoveryIssuer: `${ciamHost}/${workTenant}/v2.0`,
+    tokenIssuer: `${ciamHost}/${workTenant}/v2.0`,
+    tid: workTenant,
+    expectedSubject: "provider-subject",
+    keys: [
+      { keyIssuer: undefined, accepted: false },
+      { keyIssuer: `${ciamHost}/${workTenant}/v2.0`, tid: otherWorkTenant, accepted: false },
+      { keyIssuer: `${ciamHost}/${workTenant}/v2.0`, accepted: true },
+    ],
+  },
+  // Entra v1 (sts.windows.net/<tenant>/) JWKS omits per-key issuer, so valid v1
+  // sign-ins must succeed while still binding tid to the concrete tenant GUID.
+  {
+    name: "accepts Entra v1 JWKS without key issuer while binding tid",
+    host: entraV1Host,
+    authority: workTenant,
+    v1: true,
+    discoveryIssuer: `${entraV1Host}/${workTenant}/`,
+    tokenIssuer: `${entraV1Host}/${workTenant}/`,
+    tid: workTenant,
+    expectedSubject: "provider-subject",
+    keys: [
+      { keyIssuer: undefined, accepted: true },
+      { keyIssuer: undefined, tid: otherWorkTenant, accepted: false },
+      { keyIssuer: `${entraV1Host}/${otherWorkTenant}/`, accepted: false },
+    ],
+  },
+  // Generic {tenantid} OIDC registrations keep exact tid casing in their subject
+  // namespace and compare pinned tenant IDs case-sensitively.
+  {
+    name: "preserves exact tid casing on generic multi-tenant OIDC registrations",
+    host: genericTenantHost,
+    authority: "common",
+    discoveryIssuer: `${genericTenantHost}/{tenantid}/v2.0`,
+    tokenIssuer: `${genericTenantHost}/${uppercasePersonalTenant}/v2.0`,
+    tid: uppercasePersonalTenant,
+    expectedSubject: `${uppercasePersonalTenant}:provider-subject`,
+    keys: [{ keyIssuer: `${genericTenantHost}/${uppercasePersonalTenant}/v2.0`, accepted: true }],
+  },
+  {
+    name: "checks pinned tid case-sensitively on generic OIDC registrations",
+    host: genericTenantHost,
+    authority: personalTenant,
+    discoveryIssuer: `${genericTenantHost}/{tenantid}/v2.0`,
+    tokenIssuer: `${genericTenantHost}/${personalTenant}/v2.0`,
+    tid: personalTenant,
+    expectedSubject: "provider-subject",
+    keys: [
+      {
+        keyIssuer: `${genericTenantHost}/${personalTenant}/v2.0`,
+        tid: uppercasePersonalTenant,
+        accepted: false,
+      },
+      { keyIssuer: `${genericTenantHost}/${personalTenant}/v2.0`, accepted: true },
+    ],
+  },
+])(
+  "Entra discovery $name",
+  ({ host, authority, v1, discoveryIssuer, tokenIssuer, tid, expectedSubject, keys }) =>
+    Effect.gen(function* () {
+      const seconds = 2_000_000_000;
 
-    yield* TestClock.setTime(seconds * 1000);
-    const pair = yield* Jwk.generateKeyPair({ algorithm: "ES256", kid: "key" });
-    const signingKey = yield* Jwk.importPrivate(pair.privateKey, "ES256");
-    const issuer = `${entraHost}/${tenant}/v2.0`;
-    const configuredIssuer = `${entraHost}/${authority}/v2.0`;
-    const discoveryUrl = `${configuredIssuer}/.well-known/openid-configuration`;
-    const tokenUrl = `${entraHost}/${authority}/oauth2/v2.0/token`;
-    const jwksUrl = `${entraHost}/${authority}/discovery/v2.0/keys`;
+      yield* TestClock.setTime(seconds * 1000);
+      const pair = yield* Jwk.generateKeyPair({ algorithm: "ES256", kid: "key" });
+      const signingKey = yield* Jwk.importPrivate(pair.privateKey, "ES256");
+      const configuredIssuer = v1 ? `${host}/${authority}/` : `${host}/${authority}/v2.0`;
 
-    const EntraIdToken = Schema.Struct({
-      iss: Schema.String,
-      sub: Schema.String,
-      aud: Schema.String,
-      azp: Schema.String,
-      iat: Schema.Finite,
-      exp: Schema.Finite,
-      nonce: Schema.String,
-      tid: Schema.String,
-    });
+      const endpoints = v1
+        ? {
+            discovery: `${host}/${authority}/.well-known/openid-configuration`,
+            authorization: `${entraHost}/${authority}/oauth2/authorize`,
+            token: `${entraHost}/${authority}/oauth2/token`,
+            jwks: `${entraHost}/${authority}/discovery/keys`,
+          }
+        : {
+            discovery: `${configuredIssuer}/.well-known/openid-configuration`,
+            authorization: `${host}/${authority}/oauth2/v2.0/authorize`,
+            token: `${host}/${authority}/oauth2/v2.0/token`,
+            jwks: `${host}/${authority}/discovery/v2.0/keys`,
+          };
 
-    for (const { keyIssuer, accepted } of keys) {
-      let idToken = "";
-
-      const fetch: typeof globalThis.fetch = async (input) => {
-        const url = input instanceof Request ? input.url : String(input);
-
-        if (url === discoveryUrl) {
-          return json({
-            issuer: discoveryIssuer,
-            signing_key_issuer_required: false,
-            authorization_endpoint: `${entraHost}/${authority}/oauth2/v2.0/authorize`,
-            token_endpoint: tokenUrl,
-            jwks_uri: jwksUrl,
-            response_types_supported: ["code"],
-            code_challenge_methods_supported: ["S256"],
-            id_token_signing_alg_values_supported: ["ES256"],
-            token_endpoint_auth_methods_supported: ["client_secret_basic"],
-          });
-        }
-        if (url === tokenUrl) {
-          return json({
-            access_token: "private-access",
-            token_type: "bearer",
-            id_token: idToken,
-          });
-        }
-        if (url === jwksUrl) {
-          return json({
-            keys: [
-              {
-                ...pair.publicKey,
-                ...(keyIssuer === undefined ? {} : { issuer: keyIssuer }),
-              },
-            ],
-          });
-        }
-        throw new Error(`Unexpected endpoint ${url}`);
-      };
-
-      const protocol = yield* loadProtocol({
-        providers: [
-          {
-            protocol: "oidc",
-            provider: OAuthProviderKey.make("entra"),
-            issuer: OAuthIssuer.make(configuredIssuer),
-            responseIssuerMode: "unsupported",
-            clientId: "client",
-            clientSecret: Redacted.make("client-secret"),
-            redirectUri: OAuthRedirectUri.make("https://app.test/auth/entra/callback"),
-            idTokenSignedResponseAlg: ["ES256"],
-          },
-        ],
-      }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch));
-
-      const started = yield* protocol.prepareAuthorization({
-        provider: OAuthProviderKey.make("entra"),
-        flowId: RequestBindingFlowId.make("flow-entra"),
+      const EntraIdToken = Schema.Struct({
+        iss: Schema.String,
+        sub: Schema.String,
+        aud: Schema.String,
+        azp: Schema.String,
+        iat: Schema.Finite,
+        exp: Schema.Finite,
+        nonce: Schema.String,
+        tid: Schema.String,
       });
 
-      if (started.secrets.oidcNonce === undefined) {
-        throw new Error("Expected OIDC nonce");
+      for (const entry of keys) {
+        const { keyIssuer, accepted } = entry;
+        const tokenTid = "tid" in entry && entry.tid !== undefined ? entry.tid : tid;
+        let idToken = "";
+
+        const fetch: typeof globalThis.fetch = async (input) => {
+          const url = input instanceof Request ? input.url : String(input);
+
+          if (url === endpoints.discovery) {
+            return json({
+              issuer: discoveryIssuer,
+              ...(v1 ? {} : { signing_key_issuer_required: false }),
+              authorization_endpoint: endpoints.authorization,
+              token_endpoint: endpoints.token,
+              jwks_uri: endpoints.jwks,
+              response_types_supported: ["code"],
+              code_challenge_methods_supported: ["S256"],
+              id_token_signing_alg_values_supported: ["ES256"],
+              token_endpoint_auth_methods_supported: ["client_secret_basic"],
+            });
+          }
+          if (url === endpoints.token) {
+            return json({
+              access_token: "private-access",
+              token_type: "bearer",
+              id_token: idToken,
+            });
+          }
+          if (url === endpoints.jwks) {
+            return json({
+              keys: [
+                {
+                  ...pair.publicKey,
+                  ...(keyIssuer === undefined ? {} : { issuer: keyIssuer }),
+                },
+              ],
+            });
+          }
+          throw new Error(`Unexpected endpoint ${url}`);
+        };
+
+        const protocol = yield* loadProtocol({
+          providers: [
+            {
+              protocol: "oidc",
+              provider: OAuthProviderKey.make("entra"),
+              issuer: OAuthIssuer.make(configuredIssuer),
+              responseIssuerMode: "unsupported",
+              clientId: "client",
+              clientSecret: Redacted.make("client-secret"),
+              redirectUri: OAuthRedirectUri.make("https://app.test/auth/entra/callback"),
+              idTokenSignedResponseAlg: ["ES256"],
+            },
+          ],
+        }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch));
+
+        const started = yield* protocol.prepareAuthorization({
+          provider: OAuthProviderKey.make("entra"),
+          flowId: RequestBindingFlowId.make("flow-entra"),
+        });
+
+        if (started.secrets.oidcNonce === undefined) {
+          throw new Error("Expected OIDC nonce");
+        }
+
+        idToken = Redacted.value(
+          yield* Jwt.sign(
+            EntraIdToken,
+            {
+              iss: tokenIssuer,
+              sub: "provider-subject",
+              aud: "client",
+              azp: "client",
+              iat: seconds,
+              exp: seconds + 300,
+              nonce: Redacted.value(started.secrets.oidcNonce),
+              tid: tokenTid,
+            },
+            signingKey,
+          ),
+        );
+
+        const completed = yield* protocol
+          .exchangeVerifiedIdentity({
+            configuration: started.configuration,
+            secrets: started.secrets,
+            verificationStartedAt: DateTime.makeUnsafe(seconds * 1000),
+            response: {
+              _tag: "Code",
+              state: started.secrets.state,
+              code: Redacted.make("single-use-code"),
+            },
+          })
+          .pipe(Effect.provideService(FetchHttpClient.Fetch, fetch), Effect.result);
+
+        expect(completed).toMatchObject(
+          accepted
+            ? {
+                _tag: "Success",
+                success: { identity: { subject: expectedSubject, issuer: configuredIssuer } },
+              }
+            : { _tag: "Failure", failure: { _tag: "OAuthProtocolRejected" } },
+        );
       }
-
-      idToken = Redacted.value(
-        yield* Jwt.sign(
-          EntraIdToken,
-          {
-            iss: issuer,
-            sub: "provider-subject",
-            aud: "client",
-            azp: "client",
-            iat: seconds,
-            exp: seconds + 300,
-            nonce: Redacted.value(started.secrets.oidcNonce),
-            tid: tenant,
-          },
-          signingKey,
-        ),
-      );
-
-      const exchange = protocol
-        .exchangeVerifiedIdentity({
-          configuration: started.configuration,
-          secrets: started.secrets,
-          verificationStartedAt: DateTime.makeUnsafe(seconds * 1000),
-          response: {
-            _tag: "Code",
-            state: started.secrets.state,
-            code: Redacted.make("single-use-code"),
-          },
-        })
-        .pipe(Effect.provideService(FetchHttpClient.Fetch, fetch));
-
-      if (accepted) {
-        expect((yield* exchange).identity).toMatchObject({ subject: "provider-subject", issuer });
-      } else {
-        yield* expectTag(exchange, "OAuthProtocolRejected");
-      }
-    }
-  }).pipe(Effect.provide(platform)),
+    }).pipe(Effect.provide(platform)),
 );
