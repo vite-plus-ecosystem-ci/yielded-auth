@@ -26,13 +26,11 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import type * as Types from "effect/Types";
 
-import { reportAuthFailure, ReportedOperationDefect } from "../../internal/diagnostics";
 import { origin as Origin } from "../../internal/origin";
+import { makeSigningCodec, type SigningKeyring } from "../../internal/signing-codec";
 import { timeoutWithCause } from "../../internal/timeout";
 import * as OAuthScope from "../../OAuthScope";
-import { SubjectId } from "../../Schema";
-import { makeSessionSigningCodec, type SessionSigningKeyring } from "../../sessions/crypto";
-import { makeAccessTokenVerifier } from "./access-token";
+import { makeLocalVerifier } from "./access-token";
 import {
   makeAuthorization,
   makeOpenIdAuthorization,
@@ -47,36 +45,68 @@ import {
   MetadataConfiguration,
   type MetadataOptions,
 } from "./clients";
-import { ConsentRenderer, OpenIdConsent, escapeHtml } from "./consent";
+import {
+  defaultConsentRenderer,
+  defaultOpenIdConsent,
+  escapeHtml,
+  type ConsentRendererService,
+  type OpenIdConsentService,
+} from "./consent";
 import {
   type Access,
   BearerToken,
-  Authentication,
+  type Authentication,
   OpenIdProfile,
   OpenIdMetadata,
-  UserInfo,
   AssertionAlgorithms,
   Authorization,
   AuthorizationMetadata,
   Client,
   reject,
+  type Rejected,
   Url,
   ConfigurationError,
-  CurrentAccess,
   InvalidToken,
-  Persistence,
+  type PersistenceService,
   Random,
   ResourceMetadata,
   ScopeText,
   Text,
   TokenResponse,
   makeAccessSchema,
+  makeAuthenticationSchema,
   makeScopesSchema,
+  makeUserInfoSchema,
   maximumClientAssertionLength,
+  nonEmptySubject,
   Unavailable,
   type Record,
 } from "./models";
 import { makeIdentityTokens, scopedProfile, type IdentitySigningKeys } from "./openid";
+
+export interface ServerBinding<
+  SubjectCodec extends Schema.Codec<string, string>,
+  PersistenceId,
+  ConsentRendererId,
+  OpenIdConsentId,
+> {
+  readonly subject: SubjectCodec;
+  readonly cookiePrefix: string;
+  readonly onFailure: (cause: Cause.Cause<unknown>) => Effect.Effect<void>;
+  readonly reportedDefect: () => unknown;
+  readonly Persistence: Context.Service<PersistenceId, PersistenceService<SubjectCodec["Type"]>>;
+  readonly CurrentAccess: Context.Reference<
+    Access<OAuthScope.OAuthScope, SubjectCodec["Type"]> | undefined
+  >;
+  readonly ConsentRenderer: Context.Service<
+    ConsentRendererId,
+    ConsentRendererService<SubjectCodec["Type"]>
+  >;
+  readonly OpenIdConsent: Context.Service<
+    OpenIdConsentId,
+    OpenIdConsentService<SubjectCodec["Type"]>
+  >;
+}
 
 const now = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
 
@@ -92,34 +122,6 @@ const bearerChallenge = (
   error?: "invalid_token" | "insufficient_scope",
 ) =>
   `Bearer resource_metadata="${resourceMetadata}"${scope === undefined ? "" : `, scope="${scope}"`}${error ? `, error="${error}"` : ""}`;
-
-/** Only InvalidToken is the caller's failure. Report other reasons; interrupts keep their cause. */
-const classifyVerification = Effect.fnUntraced(function* <A>(
-  verified: Exit.Exit<A, InvalidToken | Unavailable | Cause.TimeoutError>,
-) {
-  if (verified._tag === "Success") return verified.value;
-
-  const unexpected = Cause.fromReasons(
-    verified.cause.reasons.filter(
-      (reason) =>
-        Cause.isDieReason(reason) ||
-        (Cause.isFailReason(reason) && reason.error._tag !== "OAuthServerInvalidToken"),
-    ),
-  );
-
-  yield* reportAuthFailure("http", unexpected);
-  if (Cause.hasInterrupts(verified.cause))
-    return yield* Effect.failCause(
-      Cause.fromReasons<never>([
-        ...verified.cause.reasons.filter(Cause.isInterruptReason),
-        ...(unexpected.reasons.length === 0
-          ? []
-          : [Cause.makeDieReason(ReportedOperationDefect.make({}))]),
-      ]),
-    );
-
-  return unexpected.reasons.length === 0 ? "invalid_token" : "unavailable";
-});
 
 /** An endpoint's requirement replaces its group's. */
 const requirementOf = (group: HttpApiGroup.Top, endpoint: HttpApiEndpoint.Top) =>
@@ -272,7 +274,7 @@ export interface Options {
   readonly clientMetadata?: MetadataOptions;
   /** Login must return to paths.authorize. Pending authorization stays in a private cookie. */
   readonly loginPath: string;
-  readonly keys: SessionSigningKeyring;
+  readonly keys: SigningKeyring;
 }
 
 export interface OpenIdOptions extends Omit<Options, "resource" | "clientMetadata"> {
@@ -287,34 +289,40 @@ export interface OpenIdOptions extends Omit<Options, "resource" | "clientMetadat
   readonly refreshTokens?: boolean;
 }
 
-export interface OpenIdIdentity<Scope extends OAuthScope.OAuthScope = OAuthScope.OAuthScope> {
+export interface OpenIdIdentity<
+  Scope extends OAuthScope.OAuthScope = OAuthScope.OAuthScope,
+  Subject extends string = string,
+> {
   /** Verify the current browser session. Authentication time must be the actual sign-in time. */
   readonly current: Effect.Effect<
-    Authentication | undefined,
+    Authentication<Subject> | undefined,
     Unavailable,
     HttpServerRequest.HttpServerRequest
   >;
   /** Check the same session and account authority at code redemption, refresh and UserInfo. */
-  readonly active: (authentication: Authentication) => Effect.Effect<boolean, Unavailable>;
+  readonly active: (authentication: Authentication<Subject>) => Effect.Effect<boolean, Unavailable>;
   readonly profile: (
-    input: Pick<Access<Scope>, "subjectId" | "clientId" | "scopes">,
+    input: Pick<Access<Scope, Subject>, "subjectId" | "clientId" | "scopes">,
   ) => Effect.Effect<OpenIdProfile, Unavailable>;
 }
 
-interface ServerIdentity<Scope extends OAuthScope.OAuthScope = OAuthScope.OAuthScope> {
+interface ServerIdentity<
+  Scope extends OAuthScope.OAuthScope = OAuthScope.OAuthScope,
+  Subject extends string = string,
+> {
   readonly current: Effect.Effect<
     | {
-        readonly subjectId: SubjectId;
-        readonly authentication?: Authentication;
+        readonly subjectId: Subject;
+        readonly authentication?: Authentication<Subject>;
       }
     | undefined,
     Unavailable,
     HttpServerRequest.HttpServerRequest
   >;
-  readonly openId?: Omit<OpenIdIdentity<Scope>, "current">;
+  readonly openId?: Omit<OpenIdIdentity<Scope, Subject>, "current">;
   readonly authorize: (input: {
-    readonly subjectId: SubjectId;
-    readonly authentication: Authentication | undefined;
+    readonly subjectId: Subject;
+    readonly authentication: Authentication<Subject> | undefined;
     readonly clientId: string;
     readonly resource: string;
     readonly scopes: ReadonlyArray<Scope>;
@@ -326,21 +334,72 @@ interface ServerIdentity<Scope extends OAuthScope.OAuthScope = OAuthScope.OAuthS
 const makeServer = <
   const Id extends string,
   const S extends ReadonlyArray<OAuthScope.OAuthScope>,
+  SubjectCodec extends Schema.Codec<string, string>,
+  PersistenceId,
+  ConsentRendererId,
+  OpenIdConsentId,
   R,
 >(
   id: Id,
   input: { readonly scopes: S },
-  identitySource: Effect.Effect<ServerIdentity<NoInfer<S[number]>>, never, R>,
+  identitySource: Effect.Effect<
+    ServerIdentity<NoInfer<S[number]>, NoInfer<SubjectCodec["Type"]>>,
+    never,
+    R
+  >,
+  binding: ServerBinding<SubjectCodec, PersistenceId, ConsentRendererId, OpenIdConsentId>,
 ) => {
   type Scope = S[number];
+  type Subject = SubjectCodec["Type"];
   const scopes = [...new Set<Scope>(input.scopes)];
   const ScopeSchema = Schema.Literals(scopes);
   const ScopesSchema = makeScopesSchema<Scope>(ScopeSchema);
-  const AccessSchema = makeAccessSchema<Scope>(ScopeSchema);
+  const SubjectSchema: Schema.Codec<Subject, string> = nonEmptySubject(binding.subject);
+  const SubjectType = Schema.toType(SubjectSchema);
+  const AuthenticationSchema = makeAuthenticationSchema(SubjectType);
+  const UserInfoSchema = makeUserInfoSchema(SubjectType);
+  const AccessSchema = makeAccessSchema(ScopeSchema, SubjectSchema);
+  const PublicAccessSchema = makeAccessSchema(ScopeSchema, binding.subject);
   const AuthorizationResult = makeResultSchema(ScopeSchema);
   const Clients = makeClientStore(id);
 
-  const ScopedCurrentAccess = Context.Reference<Access<Scope> | undefined>(
+  const report = (cause: Cause.Cause<unknown>) =>
+    cause.reasons.length === 0
+      ? Effect.void
+      : Effect.suspend(() => binding.onFailure(cause)).pipe(
+          Effect.ignore({}),
+          Effect.catchDefect(() => Effect.void),
+        );
+
+  /** Only InvalidToken is the caller's failure. Report other reasons; interrupts keep their cause. */
+  const classifyVerification = Effect.fnUntraced(function* <A>(
+    verified: Exit.Exit<A, InvalidToken | Unavailable | Cause.TimeoutError>,
+  ) {
+    if (verified._tag === "Success") return verified.value;
+
+    const unexpected = Cause.fromReasons(
+      verified.cause.reasons.filter(
+        (reason) =>
+          Cause.isDieReason(reason) ||
+          (Cause.isFailReason(reason) && reason.error._tag !== "OAuthServerInvalidToken"),
+      ),
+    );
+
+    yield* report(unexpected);
+    if (Cause.hasInterrupts(verified.cause))
+      return yield* Effect.failCause(
+        Cause.fromReasons<never>([
+          ...verified.cause.reasons.filter(Cause.isInterruptReason),
+          ...(unexpected.reasons.length === 0
+            ? []
+            : [Cause.makeDieReason(binding.reportedDefect())]),
+        ]),
+      );
+
+    return unexpected.reasons.length === 0 ? "invalid_token" : "unavailable";
+  });
+
+  const ScopedCurrentAccess = Context.Reference<Access<Scope, Subject> | undefined>(
     `effect-auth/OAuthServer/${id}/CurrentAccess/${JSON.stringify([...scopes].sort())}`,
     { defaultValue: () => undefined },
   );
@@ -366,7 +425,7 @@ const makeServer = <
       readonly handle: (request: Request) => Effect.Effect<Response>;
       readonly verify: (
         token: Redacted.Redacted<string>,
-      ) => Effect.Effect<Access<Scope>, InvalidToken | Unavailable>;
+      ) => Effect.Effect<Access<Scope, Subject>, InvalidToken | Unavailable>;
       /** Trusted application operation, e.g. disabling an account or connection. */
       readonly revoke: (grantId: string) => Effect.Effect<void, Unavailable>;
       readonly resource: string;
@@ -391,6 +450,7 @@ const makeServer = <
         const config = yield* Schema.decodeUnknownEffect(
           Schema.Struct({
             id: Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,47}$/)),
+            cookiePrefix: Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/)),
             origin: Origin.check(Schema.isMaxLength(256)),
             resource: Url.check(Schema.isMaxLength(512)),
             clients: Schema.Array(Client),
@@ -406,6 +466,7 @@ const makeServer = <
         )({
           ...options,
           id,
+          cookiePrefix: binding.cookiePrefix,
           scopes,
           accessTokenFormat: options.accessTokenFormat ?? "opaque",
           accessTokenLifetimeMillis: options.accessTokenLifetimeMillis ?? 600_000,
@@ -417,10 +478,11 @@ const makeServer = <
         }).pipe(Effect.mapError(() => ConfigurationError.make({})));
 
         const secure = config.origin.startsWith("https:");
-        const cookieName = `${secure ? "__Host-" : ""}yielded-${id}-consent`;
+        const cookieName = `${secure ? "__Host-" : ""}${config.cookiePrefix}-${id}-consent`;
         const resourceUrl = new URL(config.resource);
 
         if (
+          binding.subject.ast.encoding !== undefined ||
           (resourceUrl.pathname !== "/" && resourceUrl.href !== config.resource) ||
           (options.identityKeys === undefined && resourceUrl.origin !== config.origin) ||
           resourceUrl.search ||
@@ -433,24 +495,25 @@ const makeServer = <
         )
           return yield* ConfigurationError.make({});
 
+        const store = yield* binding.Persistence;
+
         const clients = yield* makeClients(
           id,
           config.clients,
           config.clientMetadata,
           config.origin,
           `${config.origin}${paths.token}`,
+          store,
         );
 
-        const store = yield* Persistence;
-
         const consentRenderer = Option.getOrElse(
-          yield* Effect.serviceOption(ConsentRenderer),
-          () => ConsentRenderer.default,
+          yield* Effect.serviceOption(binding.ConsentRenderer),
+          () => defaultConsentRenderer<Subject>(),
         );
 
         const openIdConsent = Option.getOrElse(
-          yield* Effect.serviceOption(OpenIdConsent),
-          () => OpenIdConsent.default,
+          yield* Effect.serviceOption(binding.OpenIdConsent),
+          () => defaultOpenIdConsent<Subject>(),
         );
 
         const identity = yield* identitySource;
@@ -461,16 +524,20 @@ const makeServer = <
         const openId =
           options.identityKeys === undefined
             ? undefined
-            : yield* makeIdentityTokens(options.identityKeys);
+            : yield* makeIdentityTokens(options.identityKeys, SubjectSchema);
 
         const jwtAccess =
           openId !== undefined && config.accessTokenFormat === "jwt"
-            ? yield* makeAccessTokenVerifier({
-                issuer: config.origin,
-                resource: config.resource,
-                publicKeys: openId.jwks.keys,
-                scopes,
-              })
+            ? yield* makeLocalVerifier(
+                {
+                  issuer: config.origin,
+                  resource: config.resource,
+                  publicKeys: openId.jwks.keys,
+                  scopes,
+                },
+                ScopeSchema,
+                SubjectSchema,
+              )
             : undefined;
 
         if (
@@ -498,11 +565,13 @@ const makeServer = <
 
         type Envelope = typeof Envelope.Type;
 
-        const codec = yield* makeSessionSigningCodec(Envelope, options.keys, 2048).pipe(
-          Effect.catchCause((cause) =>
-            Effect.failCause(Cause.map(cause, () => ConfigurationError.make({}))),
-          ),
-        );
+        const codec = yield* makeSigningCodec(Envelope, options.keys, {
+          version: "eas1",
+          maximumTokenBytes: 2048,
+          onConfigError: () => ConfigurationError.make({}),
+          onInvalid: () => InvalidToken.make({}),
+          onUnavailable: () => Unavailable.make({}),
+        });
 
         const random = crypto.randomBytes(32).pipe(
           Effect.map(Base64Url.encode),
@@ -517,35 +586,19 @@ const makeServer = <
           version: string,
           expiresAtMillis: number,
         ) =>
-          codec
-            .encode({
-              purpose: "oauth-server/v1",
-              issuer: config.origin,
-              server: id,
-              resource: config.resource,
-              kind,
-              grantId,
-              version,
-              expiresAtMillis,
-            })
-            .pipe(
-              Effect.catchCause((cause) =>
-                Effect.failCause(Cause.map(cause, () => Unavailable.make({}))),
-              ),
-            );
+          codec.encode({
+            purpose: "oauth-server/v1",
+            issuer: config.origin,
+            server: id,
+            resource: config.resource,
+            kind,
+            grantId,
+            version,
+            expiresAtMillis,
+          });
 
         const decode = Effect.fnUntraced(function* (token: Redacted.Redacted<string>) {
-          const value = yield* codec
-            .decode(token)
-            .pipe(
-              Effect.catchCause((cause) =>
-                Effect.failCause(
-                  Cause.map(cause, (error) =>
-                    error._tag === "SessionInvalid" ? InvalidToken.make({}) : Unavailable.make({}),
-                  ),
-                ),
-              ),
-            );
+          const value = yield* codec.decode(token);
 
           if (value.expiresAtMillis <= (yield* now)) return yield* InvalidToken.make({});
 
@@ -570,7 +623,7 @@ const makeServer = <
 
         const clientFor = clients.resolve;
 
-        const validGrant = Effect.fnUntraced(function* (record: Record, client: Client) {
+        const validGrant = Effect.fnUntraced(function* (record: Record<Subject>, client: Client) {
           return (
             matchesRedirect(client, record.authorization.redirectUri) &&
             record.authorization.scopes.every(Schema.is(ScopeSchema)) &&
@@ -614,8 +667,8 @@ const makeServer = <
 
         const commit = Effect.fnUntraced(function* (
           grantId: string,
-          before: Record,
-          after: Record,
+          before: Record<Subject>,
+          after: Record<Subject>,
         ) {
           if (!(yield* store.compareAndSet(namespace, grantId, before.version, after)))
             return yield* reject("invalid_grant");
@@ -623,10 +676,10 @@ const makeServer = <
 
         const approve = Effect.fnUntraced(function* (
           grantId: string,
-          before: Record,
-          next: Record,
+          before: Record<Subject>,
+          next: Record<Subject>,
         ) {
-          const approved: Record = {
+          const approved: Record<Subject> = {
             ...next,
             status: "Code",
             version: yield* random,
@@ -693,7 +746,9 @@ const makeServer = <
         });
 
         const handle = Effect.fn("OAuthServer.handle")(
-          function* (web: Request) {
+          function* (
+            web: Request,
+          ): Effect.fn.Return<Response, Rejected | InvalidToken | Unavailable> {
             const url = new URL(web.url);
 
             if (url.origin !== config.origin) return json({ error: "invalid_request" }, 400);
@@ -792,7 +847,7 @@ const makeServer = <
               );
 
               return json(
-                UserInfo.make({
+                UserInfoSchema.make({
                   sub: access.value.subjectId,
                   ...scopedProfile(profile, access.value.scopes),
                 }),
@@ -912,7 +967,7 @@ const makeServer = <
                   );
 
                   if (subject === undefined) return json({ error: validation.failure.error }, 400);
-                  yield* Schema.decodeEffect(SubjectId)(subject.subjectId).pipe(
+                  yield* Schema.decodeEffect(SubjectType)(subject.subjectId).pipe(
                     Effect.mapError(() => Unavailable.make({})),
                   );
 
@@ -1021,9 +1076,9 @@ const makeServer = <
               if (openId !== undefined) {
                 if (authentication === undefined) return yield* Unavailable.make({});
 
-                const verified = yield* Schema.decodeEffect(Authentication)(authentication).pipe(
-                  Effect.mapError(() => Unavailable.make({})),
-                );
+                const verified = yield* Schema.decodeEffect(AuthenticationSchema)(
+                  authentication,
+                ).pipe(Effect.mapError(() => Unavailable.make({})));
 
                 const time = yield* now;
 
@@ -1054,7 +1109,7 @@ const makeServer = <
                 });
               if (authorization.prompt === "none")
                 return callback(authorization, { error: "consent_required" });
-              yield* Schema.decodeEffect(SubjectId)(subjectId).pipe(
+              yield* Schema.decodeEffect(SubjectType)(subjectId).pipe(
                 Effect.mapError(() => Unavailable.make({})),
               );
               if (web.method === "GET") {
@@ -1062,7 +1117,7 @@ const makeServer = <
                   record.subjectId !== subjectId ||
                   record.authentication?.sessionId !== authentication?.sessionId
                 ) {
-                  const next: Record = {
+                  const next: Record<Subject> = {
                     ...record,
                     status: "Consent",
                     subjectId,
@@ -1246,7 +1301,7 @@ const makeServer = <
                   ? client.grantTypes === undefined || client.grantTypes.includes("refresh_token")
                   : config.refreshTokens && client.grantTypes?.includes("refresh_token") === true;
 
-              const next: Record = {
+              const next: Record<Subject> = {
                 status: "Active",
                 version: yield* random,
                 authorization: { ...record.authorization, scopes: granted },
@@ -1445,14 +1500,14 @@ const makeServer = <
                     ),
                   );
 
-                  yield* reportAuthFailure("http", unexpected);
+                  yield* report(unexpected);
                   if (Cause.hasInterrupts(cause))
                     return yield* Effect.failCause(
                       Cause.fromReasons<never>([
                         ...cause.reasons.filter(Cause.isInterruptReason),
                         ...(unexpected.reasons.length === 0
                           ? []
-                          : [Cause.makeDieReason(ReportedOperationDefect.make({}))]),
+                          : [Cause.makeDieReason(binding.reportedDefect())]),
                       ]),
                     );
                   if (unexpected.reasons.length !== 0)
@@ -1566,7 +1621,7 @@ const makeServer = <
               });
 
             return yield* httpEffect.pipe(
-              Effect.provideService(CurrentAccess, access),
+              Effect.provideService(binding.CurrentAccess, access),
               Effect.provideService(ScopedCurrentAccess, access),
             );
           });
@@ -1672,7 +1727,7 @@ const makeServer = <
               return HttpServerResponse.empty({ status: 503, headers: noStore });
 
             if (required === undefined) {
-              yield* reportAuthFailure("http", Cause.die(ConfigurationError.make({})));
+              yield* report(Cause.die(ConfigurationError.make({})));
 
               return HttpServerResponse.empty({ status: 503, headers: noStore });
             }
@@ -1685,7 +1740,7 @@ const makeServer = <
               return yield* deny(HttpApiError.Forbidden.make({}), "insufficient_scope");
 
             return yield* httpEffect.pipe(
-              Effect.provideService(CurrentAccess, access),
+              Effect.provideService(binding.CurrentAccess, access),
               Effect.provideService(ScopedCurrentAccess, access),
             );
           }),
@@ -1701,34 +1756,39 @@ const makeServer = <
     securityLayer,
     paths,
     Scope: ScopeSchema,
-    Access: AccessSchema,
+    Access: PublicAccessSchema,
     CurrentAccess: ScopedCurrentAccess,
     Clients,
   };
 };
 
-/** Authorization-code server for MCP/resource authorization.
- * Declared scopes retain their branded literal types throughout the server.
- * The optional Authorization service decides scopes and claims at each issue.
- */
-export const make = <const Id extends string, const S extends ReadonlyArray<OAuthScope.OAuthScope>>(
+export const makeOAuthServer = <
+  const Id extends string,
+  const S extends ReadonlyArray<OAuthScope.OAuthScope>,
+  SubjectCodec extends Schema.Codec<string, string>,
+  PersistenceId,
+  ConsentRendererId,
+  OpenIdConsentId,
+>(
   id: Id,
   input: { readonly scopes: S },
+  binding: ServerBinding<SubjectCodec, PersistenceId, ConsentRendererId, OpenIdConsentId>,
 ) => {
   type Scope = S[number];
+  type Subject = SubjectCodec["Type"];
 
   const Identity = Context.Service<
     { readonly server: Id; readonly kind: "identity" },
     {
       readonly current: Effect.Effect<
-        SubjectId | undefined,
+        Subject | undefined,
         Unavailable,
         HttpServerRequest.HttpServerRequest
       >;
     }
   >()(`effect-auth/OAuthServer/${id}/Identity`);
 
-  const authorizationSource = makeAuthorization<Id, Scope>(id);
+  const authorizationSource = makeAuthorization<Id, Scope, Subject>(id);
 
   const server = makeServer(
     id,
@@ -1741,7 +1801,7 @@ export const make = <const Id extends string, const S extends ReadonlyArray<OAut
         () => authorizationSource.default,
       );
 
-      const source: ServerIdentity<Scope> = {
+      const source: ServerIdentity<Scope, Subject> = {
         current: Effect.map(identity.current, (subjectId) =>
           subjectId === undefined ? undefined : { subjectId },
         ),
@@ -1750,6 +1810,7 @@ export const make = <const Id extends string, const S extends ReadonlyArray<OAut
 
       return source;
     }),
+    binding,
   );
 
   return {
@@ -1768,21 +1829,20 @@ export const make = <const Id extends string, const S extends ReadonlyArray<OAut
   };
 };
 
-/** Registered-client OpenID Connect code flow with PKCE, RS256 and explicit consent.
- * Standard OpenID scopes are included alongside application scopes.
- * Applications own authentication, current session validity and profile disclosure.
- * Resource JWTs and rotating refresh tokens are opt-in. Clients are static or come
- * from the Clients service; registration endpoints and front/back-channel logout
- * are not provided.
- */
-export const makeOpenId = <
+export const makeOpenIdServer = <
   const Id extends string,
   const S extends ReadonlyArray<OAuthScope.OAuthScope> = readonly [],
+  SubjectCodec extends Schema.Codec<string, string> = Schema.Codec<string, string>,
+  PersistenceId = never,
+  ConsentRendererId = never,
+  OpenIdConsentId = never,
 >(
   id: Id,
-  options: { readonly scopes?: S } = {},
+  options: { readonly scopes?: S },
+  binding: ServerBinding<SubjectCodec, PersistenceId, ConsentRendererId, OpenIdConsentId>,
 ) => {
   type OpenIdScope = S[number] | (typeof standardOpenIdScopes)[number];
+  type Subject = SubjectCodec["Type"];
   const scopes: ReadonlyArray<OpenIdScope> = [...(options.scopes ?? []), ...standardOpenIdScopes];
 
   const Identity = Context.Service<
@@ -1791,10 +1851,10 @@ export const makeOpenId = <
       readonly kind: "openid-identity";
       readonly scopes: Types.Invariant<OpenIdScope>;
     },
-    OpenIdIdentity<OpenIdScope>
+    OpenIdIdentity<OpenIdScope, Subject>
   >()(`effect-auth/OAuthServer/${id}/OpenIdIdentity`);
 
-  const authorizationSource = makeOpenIdAuthorization<Id, OpenIdScope>(id);
+  const authorizationSource = makeOpenIdAuthorization<Id, OpenIdScope, Subject>(id);
 
   const server = makeServer(
     id,
@@ -1807,7 +1867,7 @@ export const makeOpenId = <
         () => authorizationSource.default,
       );
 
-      const source: ServerIdentity<OpenIdScope> = {
+      const source: ServerIdentity<OpenIdScope, Subject> = {
         current: Effect.map(identity.current, (authentication) =>
           authentication === undefined
             ? undefined
@@ -1823,6 +1883,7 @@ export const makeOpenId = <
 
       return source;
     }),
+    binding,
   );
 
   return {

@@ -10,39 +10,41 @@ import * as Schema from "effect/Schema";
 
 import { origin } from "../../internal/origin";
 import type * as OAuthScope from "../../OAuthScope";
-import { SubjectId } from "../../Schema";
 import {
   AccessClaims,
   BearerToken,
   ConfigurationError,
   InvalidToken,
   Random,
-  Scope,
   ScopeText,
   makeAccessSchema,
   makeScopesSchema,
+  nonEmptySubject,
   Text,
   Unavailable,
   Url,
 } from "./models";
 
 /** RFC 9068 access tokens use a distinct type and audience from ID tokens. */
-export const AccessTokenClaims = Schema.Struct({
-  iss: Text,
-  sub: SubjectId,
-  aud: Text,
-  iat: Schema.Natural,
-  exp: Schema.Natural,
-  jti: Random,
-  grant_id: Random,
-  client_id: Text,
-  scope: ScopeText,
-  auth_time: Schema.Natural,
-  sid: Text,
-  claims: Schema.optionalKey(AccessClaims),
-});
+export const makeAccessTokenClaimsSchema = <S extends Schema.Codec<string, string>>(subject: S) =>
+  Schema.Struct({
+    iss: Text,
+    sub: nonEmptySubject(subject),
+    aud: Text,
+    iat: Schema.Natural,
+    exp: Schema.Natural,
+    jti: Random,
+    grant_id: Random,
+    client_id: Text,
+    scope: ScopeText,
+    auth_time: Schema.Natural,
+    sid: Text,
+    claims: Schema.optionalKey(AccessClaims),
+  });
 
-export type AccessTokenClaims = typeof AccessTokenClaims.Type;
+export type AccessTokenClaims<Subject extends string = string> = ReturnType<
+  typeof makeAccessTokenClaimsSchema<Schema.Codec<Subject, string>>
+>["Type"];
 
 export interface AccessTokenVerifierWithKeySetOptions {
   readonly issuer: string;
@@ -56,15 +58,23 @@ export interface AccessTokenVerifierOptions extends AccessTokenVerifierWithKeySe
   readonly publicKeys: ReadonlyArray<Jwk.PublicJwk>;
 }
 
-const makeVerifier = Effect.fnUntraced(function* <Scope extends OAuthScope.OAuthScope>(
+export const makeVerifier = Effect.fnUntraced(function* <
+  Scope extends OAuthScope.OAuthScope,
+  Subject extends string,
+>(
   options: AccessTokenVerifierWithKeySetOptions,
   scope: Schema.Codec<Scope, string>,
+  subject: Schema.Codec<Subject, string>,
 ) {
   const signature = yield* Signature.Signature;
   const keys = yield* Jwks.Jwks;
+
+  if (subject.ast.encoding !== undefined) return yield* ConfigurationError.make({});
   const ScopeSchema = Schema.toType(scope);
+  const SubjectSchema = nonEmptySubject(subject);
   const ScopesSchema = makeScopesSchema(ScopeSchema);
-  const AccessSchema = makeAccessSchema(ScopeSchema);
+  const AccessTokenClaimsSchema = makeAccessTokenClaimsSchema(SubjectSchema);
+  const AccessSchema = makeAccessSchema(ScopeSchema, Schema.toType(SubjectSchema));
 
   const config = yield* Schema.decodeEffect(
     Schema.Struct({
@@ -76,7 +86,7 @@ const makeVerifier = Effect.fnUntraced(function* <Scope extends OAuthScope.OAuth
   const decode = Effect.fnUntraced(function* (credential: Redacted.Redacted<string>) {
     if (!Schema.is(BearerToken)(Redacted.value(credential))) return yield* InvalidToken.make({});
 
-    const { claims } = yield* Jwt.verifyWithKeySet(AccessTokenClaims, credential, {
+    const { claims } = yield* Jwt.verifyWithKeySet(AccessTokenClaimsSchema, credential, {
       algorithms: ["RS256"],
       issuer: config.issuer,
       audience: config.resource,
@@ -137,9 +147,13 @@ const makeVerifier = Effect.fnUntraced(function* <Scope extends OAuthScope.OAuth
   };
 });
 
-const makeLocalVerifier = Effect.fnUntraced(function* <Scope extends OAuthScope.OAuthScope>(
+export const makeLocalVerifier = Effect.fnUntraced(function* <
+  Scope extends OAuthScope.OAuthScope,
+  Subject extends string,
+>(
   options: AccessTokenVerifierOptions,
   scope: Schema.Codec<Scope, string>,
+  subject: Schema.Codec<Subject, string>,
 ) {
   const publicKeys = yield* Schema.decodeUnknownEffect(
     Schema.NonEmptyArray(Jwk.PublicJwk).check(Schema.isMaxLength(16)),
@@ -151,52 +165,5 @@ const makeLocalVerifier = Effect.fnUntraced(function* <Scope extends OAuthScope.
     Effect.mapError(() => ConfigurationError.make({})),
   );
 
-  return yield* makeVerifier(options, scope).pipe(Effect.provideService(Jwks.Jwks, keys));
+  return yield* makeVerifier(options, scope, subject).pipe(Effect.provideService(Jwks.Jwks, keys));
 });
-
-/** Verify offline with trusted public keys. Revocation and permission changes
- * take effect at token expiry; use short access lifetimes and renew through the issuer.
- * Retains only the signature service; verification uses the caller's clock and context.
- * Declared scopes narrow access only after every token scope passes validation.
- */
-export function makeAccessTokenVerifier<const S extends ReadonlyArray<OAuthScope.OAuthScope>>(
-  options: AccessTokenVerifierOptions & { readonly scopes: S },
-): ReturnType<typeof makeLocalVerifier<S[number]>>;
-
-export function makeAccessTokenVerifier(
-  options: AccessTokenVerifierOptions,
-): ReturnType<typeof makeLocalVerifier<OAuthScope.OAuthScope>>;
-
-export function makeAccessTokenVerifier(options: AccessTokenVerifierOptions) {
-  return makeLocalVerifier(
-    options,
-    options.scopes === undefined ? Scope : Schema.Literals(options.scopes),
-  );
-}
-
-/** Verify with the supplied Jwks service, for example Jwks.layerRemote from
- * effect/jose. Captures only Jwks and Signature.Signature; the caller's clock and context
- * still govern verification. Retain the resolver's owning Scope while using the
- * verifier. Remote key failures become Unavailable; invalid tokens remain InvalidToken.
- *
- * The host configures the trusted key endpoint and owns its platform lifetime.
- * On Workers, retain the bounded verification with waitUntil and await its native
- * Promise in each request. Do not tie that retained verification to request abort.
- * Revocation and permission changes take effect at access-token expiry.
- */
-export function makeAccessTokenVerifierWithKeySet<
-  const S extends ReadonlyArray<OAuthScope.OAuthScope>,
->(
-  options: AccessTokenVerifierWithKeySetOptions & { readonly scopes: S },
-): ReturnType<typeof makeVerifier<S[number]>>;
-
-export function makeAccessTokenVerifierWithKeySet(
-  options: AccessTokenVerifierWithKeySetOptions,
-): ReturnType<typeof makeVerifier<OAuthScope.OAuthScope>>;
-
-export function makeAccessTokenVerifierWithKeySet(options: AccessTokenVerifierWithKeySetOptions) {
-  return makeVerifier(
-    options,
-    options.scopes === undefined ? Scope : Schema.Literals(options.scopes),
-  );
-}

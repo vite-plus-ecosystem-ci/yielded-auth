@@ -1,10 +1,10 @@
-import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import * as Jwks from "effect/jose/Jwks";
 import * as Schema from "effect/Schema";
 
 import * as OAuthScope from "../../OAuthScope";
-import { SubjectId } from "../../Schema";
+
+export type { SigningKeyring } from "../../internal/signing-codec";
 
 export class Unavailable extends Schema.TaggedError<Unavailable>()("OAuthServerUnavailable", {}) {}
 
@@ -25,6 +25,9 @@ export const maximumScopes = 1024;
 export const Scopes = Schema.NonEmptyArray(Scope).check(Schema.isMaxLength(maximumScopes));
 /** Space-separated scopes. Declared scopes must fit, so a client can request all of them. */
 export const ScopeText = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(8192));
+
+export const nonEmptySubject = <S extends Schema.Codec<string, string>>(subject: S): S["Rebuild"] =>
+  subject.check(Schema.makeFilter((value) => value.length > 0));
 
 export const makeScopesSchema = <Scope extends OAuthScope.OAuthScope>(
   scope: Schema.Codec<Scope, string>,
@@ -175,16 +178,18 @@ export const Authorization = Schema.Struct({
 
 export type Authorization = typeof Authorization.Type;
 
-/** Verified application authentication, never values supplied by an OAuth client. */
-export const Authentication = Schema.Struct({
-  subjectId: SubjectId,
-  sessionId: Text,
-  securityRevision: Text,
-  authenticatedAtMillis: Schema.Natural,
-  expiresAtMillis: Schema.Natural,
-});
+export const makeAuthenticationSchema = <S extends Schema.Codec<string, string>>(subject: S) =>
+  Schema.Struct({
+    subjectId: nonEmptySubject(subject),
+    sessionId: Text,
+    securityRevision: Text,
+    authenticatedAtMillis: Schema.Natural,
+    expiresAtMillis: Schema.Natural,
+  });
 
-export type Authentication = typeof Authentication.Type;
+export type Authentication<Subject extends string = string> = ReturnType<
+  typeof makeAuthenticationSchema<Schema.Codec<Subject, string>>
+>["Type"];
 
 /** Application-approved claims. Scope filtering happens before credential delivery. */
 export const OpenIdProfile = Schema.Struct({
@@ -221,29 +226,36 @@ export const OpenIdMetadata = Schema.Struct({
   request_uri_parameter_supported: Schema.Literal(false),
 });
 
-export const UserInfo = Schema.Struct({ sub: SubjectId, ...OpenIdProfile.fields });
+export const makeUserInfoSchema = <S extends Schema.Codec<string, string>>(subject: S) =>
+  Schema.Struct({ sub: nonEmptySubject(subject), ...OpenIdProfile.fields });
 
-/** One record owns consent, code redemption and the entire refresh family.
- * Revocation is monotonic; a stale CAS must never reactivate a revoked grant.
- * No bearer credentials or provider tokens are persisted here.
- */
-export const Record = Schema.Struct({
-  version: Random,
-  status: Schema.Literals(["Pending", "Consent", "Code", "Active", "Revoked"]),
-  authorization: Authorization,
-  subjectId: Schema.optionalKey(SubjectId),
-  authentication: Schema.optionalKey(Authentication),
-  claims: Schema.optionalKey(AccessClaims),
-  expiresAtMillis: Schema.Natural,
-});
+export const makeRecordSchema = <S extends Schema.Codec<string, string>>(subject: S) => {
+  const checked = nonEmptySubject(subject);
 
-export type Record = typeof Record.Type;
+  return Schema.Struct({
+    version: Random,
+    status: Schema.Literals(["Pending", "Consent", "Code", "Active", "Revoked"]),
+    authorization: Authorization,
+    subjectId: Schema.optionalKey(checked),
+    authentication: Schema.optionalKey(makeAuthenticationSchema(checked)),
+    claims: Schema.optionalKey(AccessClaims),
+    expiresAtMillis: Schema.Natural,
+  });
+};
 
-export const makeAccessSchema = <Scope extends OAuthScope.OAuthScope>(
+export type Record<Subject extends string = string> = ReturnType<
+  typeof makeRecordSchema<Schema.Codec<Subject, string>>
+>["Type"];
+
+export const makeAccessSchema = <
+  Scope extends OAuthScope.OAuthScope,
+  S extends Schema.Codec<string, string>,
+>(
   scope: Schema.Codec<Scope, string>,
+  subject: S,
 ) =>
   Schema.Struct({
-    subjectId: SubjectId,
+    subjectId: nonEmptySubject(subject),
     grantId: Random,
     clientId: Text,
     resource: Text,
@@ -251,21 +263,10 @@ export const makeAccessSchema = <Scope extends OAuthScope.OAuthScope>(
     claims: Schema.optionalKey(AccessClaims),
   });
 
-export const Access = makeAccessSchema(Scope);
-
-export type Access<Scope extends OAuthScope.OAuthScope = OAuthScope.OAuthScope> = ReturnType<
-  typeof makeAccessSchema<Scope>
->["Type"];
-
-/** Request-local authenticated authority. Absent outside protected requests;
- * callers must reject undefined. Never provide a principal at server startup.
- * A Reference models absent authentication without a fake construction-time
- * identity when Effect registers toolkit handlers. MCP client IDs are unrelated.
- */
-export const CurrentAccess = Context.Reference<Access | undefined>(
-  "effect-auth/OAuthServer/CurrentAccess",
-  { defaultValue: () => undefined },
-);
+export type Access<
+  Scope extends OAuthScope.OAuthScope = OAuthScope.OAuthScope,
+  Subject extends string = string,
+> = ReturnType<typeof makeAccessSchema<Scope, Schema.Codec<Subject, string>>>["Type"];
 
 /** A consumed assertion's identity and retention deadline, never its signed credential. */
 export const AssertionReceipt = Schema.Struct({
@@ -276,34 +277,29 @@ export const AssertionReceipt = Schema.Struct({
 
 export type AssertionReceipt = typeof AssertionReceipt.Type;
 
-/** Linearizable, standalone commits. Never retry an ambiguous insert or CAS.
- * Revoke must atomically disable the record, including against concurrent CAS.
- * Grant IDs must never be reused. Retain records through expiresAtMillis;
- * only then may they be deleted.
- */
-export class Persistence extends Context.Service<
-  Persistence,
-  {
-    /** Atomically consume (issuer namespace, receipt id) once, across processes.
-     * Retain through expiresAtMillis. An unknown commit outcome must fail closed;
-     * never retry the insert or release a consumed receipt after a later failure.
-     */
-    readonly consumeAssertion: (
-      namespace: string,
-      receipt: AssertionReceipt,
-    ) => Effect.Effect<boolean, Unavailable>;
-    readonly get: (namespace: string, id: string) => Effect.Effect<Record | undefined, Unavailable>;
-    readonly insert: (
-      namespace: string,
-      id: string,
-      record: Record,
-    ) => Effect.Effect<boolean, Unavailable>;
-    readonly compareAndSet: (
-      namespace: string,
-      id: string,
-      version: string,
-      record: Record,
-    ) => Effect.Effect<boolean, Unavailable>;
-    readonly revoke: (namespace: string, id: string) => Effect.Effect<void, Unavailable>;
-  }
->()("effect-auth/OAuthServer/Persistence") {}
+export interface PersistenceService<Subject extends string = string> {
+  /** Atomically consume (issuer namespace, receipt id) once, across processes.
+   * Retain through expiresAtMillis. An unknown commit outcome must fail closed;
+   * never retry the insert or release a consumed receipt after a later failure.
+   */
+  readonly consumeAssertion: (
+    namespace: string,
+    receipt: AssertionReceipt,
+  ) => Effect.Effect<boolean, Unavailable>;
+  readonly get: (
+    namespace: string,
+    id: string,
+  ) => Effect.Effect<Record<Subject> | undefined, Unavailable>;
+  readonly insert: (
+    namespace: string,
+    id: string,
+    record: Record<Subject>,
+  ) => Effect.Effect<boolean, Unavailable>;
+  readonly compareAndSet: (
+    namespace: string,
+    id: string,
+    version: string,
+    record: Record<Subject>,
+  ) => Effect.Effect<boolean, Unavailable>;
+  readonly revoke: (namespace: string, id: string) => Effect.Effect<void, Unavailable>;
+}
