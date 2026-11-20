@@ -1,19 +1,24 @@
 import * as Discovery from "@yielded/oauth/Discovery";
+import * as OAuth from "@yielded/oauth/OAuth";
 import * as OAuthError from "@yielded/oauth/OAuthError";
 import * as Oidc from "@yielded/oauth/Oidc";
 import * as Cause from "effect/Cause";
-import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as Digest from "effect/crypto/Digest";
 import * as Mac from "effect/crypto/Mac";
 import * as Signature from "effect/crypto/Signature";
 import * as Effect from "effect/Effect";
 import * as Base64Url from "effect/encoding/Base64Url";
+import * as Exit from "effect/Exit";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpClient from "effect/http/HttpClient";
 import * as Jwk from "effect/jose/Jwk";
 import * as Jwks from "effect/jose/Jwks";
 import * as Redacted from "effect/Redacted";
+import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 
+import { reportAuthDiagnostic, reportAuthFailure } from "../../../internal/diagnostics";
 import { makeScopedOperation } from "../../../internal/scoped-operation";
 import { OAuthUnavailable } from "../../signInErrors";
 import {
@@ -22,17 +27,23 @@ import {
   isTenantIssuerTemplate,
 } from "../microsoft/discovery";
 import { makeEntraIssuerPolicy, makeEntraJwks } from "../microsoft/jwks";
-import { classifyOAuthConfigurationError } from "./classifyOAuthError";
+import { classifyOAuthConfigurationError, classifyOAuthError } from "./classifyOAuthError";
 import {
   installProvider,
+  nativeAuthentication,
   prepareConfigurations,
   registrationKind,
+  validateCallbackAuthorizationUrls,
+  validateProviderMetadata,
   type InstalledProvider,
+  type ResolvedProvider,
 } from "./configuration";
 import {
   installConnectedProvider,
   prepareConnectedConfigurations,
+  validateConnectedProviderMetadata,
   type InstalledConnectedProvider,
+  type ResolvedConnectedProvider,
 } from "./connected/configuration";
 import type { OpenIdConnectConnectedProtocolOptions } from "./connected/models";
 import {
@@ -51,130 +62,57 @@ import {
   type OpenIdConnectOAuthProtocolOptions,
 } from "./models";
 import type { NativeKeySet, Requirements as OAuthRequirements } from "./native";
+import { PrivateKeyClientSecret } from "./privateKeyJwt";
 
 export type Requirements = OAuthRequirements | Signature.Signature | Mac.Mac;
 
-export interface DiscoveredProviderMetadata {
-  readonly metadata: Discovery.Metadata;
-  /** Local policy flag set when discovery pinned a template or `consumers` issuer. */
+const REGISTRATION_COOLDOWN_MILLIS = 30_000;
+
+interface EntraPolicy {
   readonly signingKeyIssuerRequired: boolean;
-  /** Pinned tenant GUID that signed `tid` must match when discovery pinned a tenant or `consumers`. */
   readonly expectedTenantId: string | undefined;
-  /** Local tenant exclusion for the matched issuer template. */
   readonly excludedTenantId: string | undefined;
+  readonly caseInsensitiveTenantId: boolean;
 }
 
-/** Inward discovery port. One initialization owns the successful responses;
- * exact discovery policy and effective transport identities stay independent. */
-export class ProviderDiscovery extends Context.Service<
-  ProviderDiscovery,
-  {
-    readonly discover: (
-      issuer: string,
-      timeoutSeconds: number,
-      metadataUrl: string | undefined,
-      profile?: typeof DiscoveryProfile.Type,
-    ) => Effect.Effect<
-      DiscoveredProviderMetadata,
-      OpenIdConnectConfigurationError | OAuthUnavailable,
-      HttpClient.HttpClient
-    >;
-  }
->()("effect-auth/oauth/providers/ProviderDiscovery") {
-  /** Evaluate once at each initialization root, never at module or declaration scope. */
-  static readonly make = Effect.sync(() => {
-    const cache = new Map<
-      string,
-      {
-        readonly client: HttpClient.HttpClient;
-        readonly fetch: typeof globalThis.fetch;
-        readonly discovered: DiscoveredProviderMetadata;
-      }
-    >();
+interface SharedDiscoveryDocument {
+  readonly metadata: Discovery.Metadata;
+  readonly policy: EntraPolicy;
+  readonly fetchedAt: number;
+}
 
-    return ProviderDiscovery.of({
-      discover: Effect.fnUntraced(function* (
-        issuer: string,
-        timeoutSeconds: number,
-        metadataUrl: string | undefined,
-        profile?: typeof DiscoveryProfile.Type,
-      ) {
-        const client = yield* HttpClient.HttpClient;
-        const fetch = yield* FetchHttpClient.Fetch;
-        // oxlint-disable-next-line no-restricted-properties -- Collision-free tuple of bounded, validated discovery configuration.
-        const key = JSON.stringify([issuer, timeoutSeconds, metadataUrl ?? null, profile ?? null]);
-        const found = cache.get(key);
+interface SharedDiscoveryHandle {
+  /** Resolve the shared raw discovery document (single-flight per issuer).
+   * When `minFetchedAfter` is supplied by a registration that rejected an older
+   * document and has passed cooldown, performs a fresh fetch without evicting
+   * or closing any previously resolved document. */
+  readonly resolve: (
+    minFetchedAfter?: number,
+  ) => Effect.Effect<SharedDiscoveryDocument, OAuthError.OAuthError>;
+}
 
-        if (found?.client === client && found.fetch === fetch) return found.discovered;
+/** Shared lazy discovery cache within one provider installation (including its
+ * generations and retained-access configuration). Shares only the raw fetch;
+ * each registration pins its own validated local snapshot. */
+export type DiscoveryCache = Map<string, SharedDiscoveryHandle>;
 
-        let pinned = false;
-        let expectedTenantId: string | undefined;
-        let excludedTenantId: string | undefined;
+export const makeDiscoveryCache = (): DiscoveryCache => new Map();
 
-        const metadata = yield* Effect.scoped(
-          Discovery.makeRemote({
-            issuer,
-            timeout: timeoutSeconds * 1000,
-            ...(metadataUrl === undefined ? {} : { url: metadataUrl }),
-            issuerMatcher: (configuredIssuer, discoveredIssuer) => {
-              const matched = matchEntraDiscoveryIssuer(
-                configuredIssuer,
-                discoveredIssuer,
-                profile === "microsoft",
-              );
-
-              if (matched === undefined) {
-                return Effect.fail(
-                  new OAuthError.OAuthError({
-                    reason: new OAuthError.DiscoveryFailed({
-                      description: "Discovered issuer does not match configured issuer",
-                    }),
-                  }),
-                );
-              }
-
-              pinned = matched.pinned;
-              expectedTenantId = matched.expectedTenantId;
-              excludedTenantId = matched.excludedTenantId;
-
-              return Effect.succeed(matched.issuer);
-            },
-            ...(profile === undefined
-              ? {}
-              : {
-                  supplement: (normalized) =>
-                    supplementDiscovery(normalized, profile).pipe(
-                      Effect.mapError(
-                        () =>
-                          new OAuthError.OAuthError({
-                            reason: new OAuthError.DiscoveryFailed({
-                              description: "Discovered metadata failed provider profile validation",
-                            }),
-                          }),
-                      ),
-                    ),
-                }),
-          }).pipe(Effect.flatMap((service) => service.resolve)),
-        ).pipe(
-          Effect.catchCause((cause) =>
-            Effect.failCause(Cause.map(cause, classifyOAuthConfigurationError)),
-          ),
-        );
-
-        const discovered: DiscoveredProviderMetadata = {
-          metadata,
-          signingKeyIssuerRequired: pinned,
-          expectedTenantId,
-          excludedTenantId,
-        };
-
-        cache.set(key, { client, fetch, discovered });
-
-        return discovered;
-      }),
-    });
+const discoveryFailed = (description: string, cause?: unknown): OAuthError.OAuthError =>
+  new OAuthError.OAuthError({
+    reason: new OAuthError.DiscoveryFailed({
+      description,
+      ...(cause === undefined ? {} : { cause }),
+    }),
   });
-}
+
+const transportFailed = (description: string): OAuthError.OAuthError =>
+  new OAuthError.OAuthError({
+    reason: new OAuthError.TransportFailed({
+      endpoint: "discovery",
+      description,
+    }),
+  });
 
 const asymmetricAlgorithmsOf = (
   advertised: ReadonlyArray<IdTokenSignedResponseAlg>,
@@ -182,6 +120,334 @@ const asymmetricAlgorithmsOf = (
   advertised.filter(
     (algorithm): algorithm is Exclude<IdTokenSignedResponseAlg, "HS256"> => algorithm !== "HS256",
   );
+
+const makeSharedDiscovery = Effect.fnUntraced(function* (options: {
+  readonly issuer: string;
+  readonly timeoutSeconds: number;
+  readonly metadataUrl: string | undefined;
+  readonly profile: typeof DiscoveryProfile.Type | undefined;
+}) {
+  const layerScope = yield* Effect.scope;
+  const baseHttp = yield* HttpClient.HttpClient;
+  const fetch = yield* FetchHttpClient.Fetch;
+  const refetchSemaphore = yield* Semaphore.make(1);
+  const isMicrosoftProfile = options.profile === "microsoft";
+  const reportedErrors = new WeakSet<object>();
+  let closed = false;
+
+  const reportOnce = Effect.fnUntraced(function* (error: OAuthError.OAuthError) {
+    if (reportedErrors.has(error)) return;
+    reportedErrors.add(error);
+
+    if (error.reason._tag === "DiscoveryFailed") {
+      yield* reportAuthDiagnostic("oauth-registration", "configuration");
+      yield* reportAuthFailure("oauth-registration", Cause.fail(error));
+    } else if (
+      error.reason._tag === "TransportFailed" &&
+      error.reason.description !== "Discovery is cooling down after a failed fetch" &&
+      error.reason.description !== "The discovery scope is closed"
+    ) {
+      yield* reportAuthDiagnostic("oauth-registration", "unavailable");
+    }
+  });
+
+  // Each attempt owns a single `Discovery.makeRemote` with infinite TTL, so it
+  // succeeds at most once and its matched Entra policy and fetch timestamp stay
+  // strictly paired with that single resolved document.
+  const createAttempt = Effect.fnUntraced(function* () {
+    const attemptScope = yield* Scope.fork(layerScope, "sequential");
+    let matchedPolicy: EntraPolicy | undefined;
+    let succeededAt: number | undefined;
+
+    const remote = yield* Discovery.makeRemote({
+      issuer: options.issuer,
+      timeout: options.timeoutSeconds * 1000,
+      ...(options.metadataUrl === undefined ? {} : { url: options.metadataUrl }),
+      issuerMatcher: (configuredIssuer, discoveredIssuer) => {
+        const matched = matchEntraDiscoveryIssuer(
+          configuredIssuer,
+          discoveredIssuer,
+          isMicrosoftProfile,
+        );
+
+        if (matched === undefined) {
+          matchedPolicy = undefined;
+
+          return Effect.fail(discoveryFailed("Discovered issuer does not match configured issuer"));
+        }
+
+        const concrete = concreteEntraAuthority(matched.issuer, isMicrosoftProfile);
+
+        matchedPolicy = {
+          signingKeyIssuerRequired: matched.pinned || (concrete?.signingKeyIssuerRequired ?? false),
+          expectedTenantId: matched.expectedTenantId ?? concrete?.tenantId,
+          excludedTenantId: matched.excludedTenantId,
+          caseInsensitiveTenantId: isKnownEntraAuthority(matched.issuer, isMicrosoftProfile),
+        };
+
+        return Effect.succeed(matched.issuer);
+      },
+      supplement: Effect.fnUntraced(function* (normalized) {
+        return options.profile === undefined
+          ? normalized
+          : yield* supplementDiscovery(normalized, options.profile).pipe(
+              Effect.mapError((error) =>
+                discoveryFailed("Discovered metadata failed provider profile validation", error),
+              ),
+            );
+      }),
+    }).pipe(
+      Effect.provideService(Scope.Scope, attemptScope),
+      Effect.provideService(HttpClient.HttpClient, baseHttp),
+      Effect.provideService(FetchHttpClient.Fetch, fetch),
+      Effect.onError(() => Scope.close(attemptScope, Exit.void).pipe(Effect.ignore)),
+    );
+
+    const resolveAttempt: Effect.Effect<SharedDiscoveryDocument, OAuthError.OAuthError> =
+      remote.resolve.pipe(
+        Effect.tapError(reportOnce),
+        Effect.flatMap((metadata) =>
+          Effect.gen(function* () {
+            if (matchedPolicy === undefined) {
+              return yield* discoveryFailed("Missing discovery issuer policy");
+            }
+
+            if (succeededAt === undefined) {
+              succeededAt = yield* Clock.currentTimeMillis;
+            }
+
+            return { metadata, policy: matchedPolicy, fetchedAt: succeededAt };
+          }),
+        ),
+      );
+
+    return {
+      scope: attemptScope,
+      resolve: resolveAttempt,
+      get fetchedAt() {
+        return succeededAt;
+      },
+    };
+  });
+
+  // Static URL/issuer validation runs at Layer build with zero network I/O.
+  const initialAttempt = yield* createAttempt().pipe(
+    Effect.catchCause((cause) =>
+      Effect.failCause(Cause.map(cause, classifyOAuthConfigurationError)),
+    ),
+  );
+
+  // Most recent successfully fetched raw document; never evicted on a failed refetch.
+  let latest: SharedDiscoveryDocument | undefined;
+  let refetchAttempt: Effect.Success<ReturnType<typeof createAttempt>> | undefined;
+
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      closed = true;
+    }),
+  );
+
+  const resolve = (
+    minFetchedAfter?: number,
+  ): Effect.Effect<SharedDiscoveryDocument, OAuthError.OAuthError> =>
+    Effect.suspend(() => {
+      if (closed) return Effect.fail(transportFailed("The discovery scope is closed"));
+
+      if (minFetchedAfter === undefined) {
+        if (latest !== undefined) return Effect.succeed(latest);
+
+        return initialAttempt.resolve.pipe(
+          Effect.tap((document) =>
+            Effect.sync(() => {
+              if (latest === undefined || document.fetchedAt > latest.fetchedAt) {
+                latest = document;
+              }
+            }),
+          ),
+        );
+      }
+
+      if (latest !== undefined && latest.fetchedAt > minFetchedAfter) {
+        return Effect.succeed(latest);
+      }
+
+      return refetchSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          if (closed) return yield* transportFailed("The discovery scope is closed");
+          if (latest !== undefined && latest.fetchedAt > minFetchedAfter) {
+            return latest;
+          }
+
+          if (refetchAttempt === undefined || refetchAttempt.fetchedAt !== undefined) {
+            const next = yield* createAttempt();
+            const previous = refetchAttempt;
+
+            refetchAttempt = next;
+            if (previous !== undefined) {
+              yield* Scope.close(previous.scope, Exit.void).pipe(Effect.ignore);
+            }
+          }
+
+          // Only publish `latest` after the refetch succeeds; a failed refetch
+          // leaves any previously resolved document intact and retains cooldown.
+          const document = yield* refetchAttempt.resolve;
+
+          if (latest === undefined || document.fetchedAt > latest.fetchedAt) {
+            latest = document;
+          }
+
+          return document;
+        }),
+      );
+    });
+
+  return { resolve } satisfies SharedDiscoveryHandle;
+});
+
+const getSharedDiscovery = Effect.fnUntraced(function* (
+  cache: DiscoveryCache,
+  options: {
+    readonly issuer: string;
+    readonly timeoutSeconds: number;
+    readonly metadataUrl: string | undefined;
+    readonly profile: typeof DiscoveryProfile.Type | undefined;
+  },
+) {
+  const key = JSON.stringify([
+    options.issuer,
+    options.timeoutSeconds,
+    options.metadataUrl ?? "",
+    options.profile ?? "",
+  ]);
+
+  const existing = cache.get(key);
+
+  if (existing !== undefined) return existing;
+
+  const created = yield* makeSharedDiscovery(options);
+
+  cache.set(key, created);
+
+  return created;
+});
+
+const makeLazyResolved = Effect.fnUntraced(function* <A>(
+  discovery: SharedDiscoveryHandle,
+  build: (
+    metadata: Discovery.Metadata,
+    policy: EntraPolicy,
+  ) => Effect.Effect<A, OpenIdConnectConfigurationError | OAuthUnavailable, Scope.Scope>,
+) {
+  const layerScope = yield* Effect.scope;
+  const semaphore = yield* Semaphore.make(1);
+  let closed = false;
+
+  // Once validated, this registration pins its own immutable local client,
+  // verifier, and discovery snapshot for the lifetime of the Layer scope.
+  let cached: A | undefined;
+
+  let rejected:
+    | {
+        readonly fetchedAt: number;
+        readonly failedAt: number;
+      }
+    | undefined;
+
+  const isClosed = (): boolean => closed;
+  const readCached = (): A | undefined => cached;
+
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      closed = true;
+    }),
+  );
+
+  return {
+    resolve: Effect.gen(function* () {
+      if (isClosed()) return yield* OAuthUnavailable.make({});
+
+      const initial = readCached();
+
+      if (initial !== undefined) return initial;
+
+      const now = yield* Clock.currentTimeMillis;
+
+      if (rejected !== undefined && now - rejected.failedAt < REGISTRATION_COOLDOWN_MILLIS) {
+        return yield* OAuthUnavailable.make({});
+      }
+
+      const minFetchedAfter = rejected?.fetchedAt;
+
+      const { metadata, policy, fetchedAt } = yield* discovery
+        .resolve(minFetchedAfter)
+        .pipe(
+          Effect.mapError((error) =>
+            classifyOAuthError(error, { operation: "authorization_code", phase: "preSend" }),
+          ),
+        );
+
+      const afterDiscovery = readCached();
+
+      if (afterDiscovery !== undefined) return afterDiscovery;
+
+      return yield* semaphore.withPermits(1)(
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            if (isClosed()) return yield* OAuthUnavailable.make({});
+
+            const insideLock = readCached();
+
+            if (insideLock !== undefined) return insideLock;
+
+            const checkNow = yield* Clock.currentTimeMillis;
+
+            if (
+              rejected !== undefined &&
+              rejected.fetchedAt === fetchedAt &&
+              checkNow - rejected.failedAt < REGISTRATION_COOLDOWN_MILLIS
+            ) {
+              return yield* OAuthUnavailable.make({});
+            }
+
+            const childScope = yield* Scope.fork(layerScope, "sequential");
+
+            const built = yield* Effect.exit(
+              restore(build(metadata, policy).pipe(Effect.provideService(Scope.Scope, childScope))),
+            );
+
+            if (Exit.isFailure(built)) {
+              yield* Scope.close(childScope, Exit.void).pipe(Effect.ignore);
+              if (Cause.hasInterruptsOnly(built.cause)) {
+                return yield* Effect.failCause(
+                  Cause.map(built.cause, () => OAuthUnavailable.make({})),
+                );
+              }
+
+              const finishedAt = yield* Clock.currentTimeMillis;
+
+              rejected = { fetchedAt, failedAt: finishedAt };
+              yield* reportAuthDiagnostic("oauth-registration", "configuration");
+              yield* reportAuthFailure("oauth-registration", built.cause);
+
+              return yield* OAuthUnavailable.make({});
+            }
+
+            if (isClosed()) {
+              yield* Scope.close(childScope, Exit.void).pipe(Effect.ignore);
+
+              return yield* OAuthUnavailable.make({});
+            }
+
+            rejected = undefined;
+            cached = built.value;
+
+            return built.value;
+          }),
+        ),
+      );
+    }),
+  };
+});
 
 const makeHmacVerifier = Effect.fn("OpenIdConnect.makeHmacVerifier")(function* (
   issuer: string,
@@ -320,7 +586,7 @@ const makeNativeKeySet = Effect.fn("OpenIdConnect.makeNativeKeySet")(function* (
 ): Effect.fn.Return<
   NativeKeySet,
   OpenIdConnectConfigurationError | OAuthUnavailable,
-  HttpClient.HttpClient | Signature.Signature | Digest.Digest | OAuthRequirements
+  HttpClient.HttpClient | Signature.Signature | Digest.Digest | Scope.Scope
 > {
   const advertised = advertisedIdTokenAlgorithms(
     metadata.id_token_signing_alg_values_supported,
@@ -362,101 +628,136 @@ const makeNativeKeySet = Effect.fn("OpenIdConnect.makeNativeKeySet")(function* (
   };
 });
 
-/** Only the OIDC adapter installs discovery and signed ID-token verification. */
+/** Only the OIDC adapter installs lazy remote discovery and signed ID-token verification. */
 export const installConfigurations = Effect.fn("OpenIdConnect.installConfigurations")(function* <R>(
   input: OpenIdConnectOAuthProtocolOptions<R>,
+  discoveryCache: DiscoveryCache = makeDiscoveryCache(),
 ) {
-  const discovery = yield* ProviderDiscovery;
-  const http = yield* captureHardenedHttp;
+  const baseHttp = yield* HttpClient.HttpClient;
+  const fetch = yield* FetchHttpClient.Fetch;
+  const hardenedHttp = yield* captureHardenedHttp;
+  const signature = yield* Signature.Signature;
+  const digest = yield* Digest.Digest;
+  const mac = yield* Mac.Mac;
+  const clientSecrets = yield* PrivateKeyClientSecret;
   const { providers, timeoutSeconds } = yield* prepareConfigurations(input);
   const installed: InstalledProvider<R>[] = [];
 
   for (const provider of providers) {
-    let raw: Discovery.Metadata;
-    let signingKeyIssuerRequired = false;
-    let expectedTenantId: string | undefined;
-    let excludedTenantId: string | undefined;
-    let caseInsensitiveTenantId = false;
-
-    if (provider.protocol === "oidc") {
-      const discovered = yield* discovery.discover(
-        provider.issuer,
-        timeoutSeconds,
-        discoveryMetadataUrl(provider[discoveryProfile]),
-        provider[discoveryProfile],
-      );
-
-      const isMicrosoftProfile = provider[discoveryProfile] === "microsoft";
-      const concrete = concreteEntraAuthority(discovered.metadata.issuer, isMicrosoftProfile);
-
-      raw = discovered.metadata;
-      signingKeyIssuerRequired =
-        discovered.signingKeyIssuerRequired || (concrete?.signingKeyIssuerRequired ?? false);
-      expectedTenantId = discovered.expectedTenantId ?? concrete?.tenantId;
-      excludedTenantId = discovered.excludedTenantId;
-      caseInsensitiveTenantId = isKnownEntraAuthority(
-        discovered.metadata.issuer,
-        isMicrosoftProfile,
-      );
-    } else {
-      raw = {
-        issuer: provider.issuer,
-        authorization_endpoint: provider.authorizationEndpoint,
-        token_endpoint: provider.tokenEndpoint,
-        response_types_supported: ["code"],
-        ...(provider.pkceS256 ? { code_challenge_methods_supported: ["S256"] } : {}),
-        authorization_response_iss_parameter_supported: provider.responseIssuerMode === "required",
-      };
-    }
-
-    const entry = yield* installProvider(provider, raw, timeoutSeconds);
-
     if (provider.protocol !== "oidc") {
-      installed.push(entry);
+      const resolved = yield* installProvider(
+        provider,
+        {
+          issuer: provider.issuer,
+          authorization_endpoint: provider.authorizationEndpoint,
+          token_endpoint: provider.tokenEndpoint,
+          response_types_supported: ["code"],
+          ...(provider.pkceS256 ? { code_challenge_methods_supported: ["S256"] } : {}),
+          authorization_response_iss_parameter_supported:
+            provider.responseIssuerMode === "required",
+        },
+        timeoutSeconds,
+      );
+
+      installed.push({ provider, resolve: Effect.succeed(resolved) });
       continue;
     }
 
-    if (registrationKind(provider) === "native") {
-      installed.push({
-        ...entry,
-        nativeKeySet: yield* makeNativeKeySet(entry.metadata, timeoutSeconds, {
-          algorithms: provider.idTokenSignedResponseAlg,
-          signingKeyIssuerRequired,
-          expectedTenantId,
-          excludedTenantId,
-          caseInsensitiveTenantId,
+    const isNative = registrationKind(provider) === "native";
+    const clientAuth = nativeAuthentication(provider.authentication, clientSecrets);
+
+    const sharedDiscovery = yield* getSharedDiscovery(discoveryCache, {
+      issuer: provider.issuer,
+      timeoutSeconds,
+      metadataUrl: discoveryMetadataUrl(provider[discoveryProfile]),
+      profile: provider[discoveryProfile],
+    });
+
+    if (isNative) {
+      const { resolve } = yield* makeLazyResolved<ResolvedProvider<R>>(
+        sharedDiscovery,
+        Effect.fnUntraced(function* (metadata, policy) {
+          const validated = yield* validateProviderMetadata(provider, metadata);
+
+          const nativeKeySet = yield* makeNativeKeySet(validated, timeoutSeconds, {
+            algorithms: provider.idTokenSignedResponseAlg,
+            ...policy,
+          }).pipe(
+            Effect.provideService(HttpClient.HttpClient, baseHttp),
+            Effect.provideService(FetchHttpClient.Fetch, fetch),
+            Effect.provideService(Signature.Signature, signature),
+            Effect.provideService(Digest.Digest, digest),
+          );
+
+          return { provider, metadata: validated, nativeKeySet };
         }),
-      });
+      );
+
+      installed.push({ provider, resolve });
       continue;
     }
 
-    const localDiscovery = yield* Discovery.makeLocal(entry.metadata).pipe(
-      Effect.catchCause((cause) =>
-        Effect.failCause(Cause.map(cause, classifyOAuthConfigurationError)),
-      ),
+    const { resolve } = yield* makeLazyResolved<ResolvedProvider<R>>(
+      sharedDiscovery,
+      Effect.fnUntraced(function* (metadata, policy) {
+        const validated = yield* validateProviderMetadata(provider, metadata);
+
+        // Bind the registration's client, verifier, and UserInfo discovery to
+        // its own immutable validated snapshot so sibling refetches cannot swap
+        // endpoints under validated operations.
+        const localDiscovery = yield* Discovery.makeLocal(validated).pipe(
+          Effect.catchCause((cause) =>
+            Effect.failCause(Cause.map(cause, classifyOAuthConfigurationError)),
+          ),
+        );
+
+        const client = yield* OAuth.make({
+          clientId: provider.clientId,
+          clientAuth,
+          timeout: timeoutSeconds * 1000,
+        }).pipe(
+          Effect.provideService(Discovery.Discovery, localDiscovery),
+          Effect.provideService(HttpClient.HttpClient, baseHttp),
+          Effect.provideService(FetchHttpClient.Fetch, fetch),
+          Effect.catchCause((cause) =>
+            Effect.failCause(Cause.map(cause, classifyOAuthConfigurationError)),
+          ),
+        );
+
+        yield* validateCallbackAuthorizationUrls(provider, client);
+
+        const verifier = yield* makeVerifier(
+          validated,
+          localDiscovery,
+          provider.clientId,
+          timeoutSeconds,
+          {
+            algorithms: provider.idTokenSignedResponseAlg,
+            ...policy,
+            ...(hasStaticSecret(provider.authentication)
+              ? { clientSecret: provider.authentication.secret }
+              : {}),
+          },
+        ).pipe(
+          Effect.provideService(HttpClient.HttpClient, baseHttp),
+          Effect.provideService(FetchHttpClient.Fetch, fetch),
+          Effect.provideService(Signature.Signature, signature),
+          Effect.provideService(Digest.Digest, digest),
+          Effect.provideService(Mac.Mac, mac),
+        );
+
+        return {
+          provider,
+          metadata: validated,
+          client,
+          discovery: localDiscovery,
+          http: hardenedHttp,
+          verifier,
+        };
+      }),
     );
 
-    installed.push({
-      ...entry,
-      discovery: localDiscovery,
-      http,
-      verifier: yield* makeVerifier(
-        entry.metadata,
-        localDiscovery,
-        provider.clientId,
-        timeoutSeconds,
-        {
-          algorithms: provider.idTokenSignedResponseAlg,
-          signingKeyIssuerRequired,
-          expectedTenantId,
-          excludedTenantId,
-          caseInsensitiveTenantId,
-          ...(hasStaticSecret(provider.authentication)
-            ? { clientSecret: provider.authentication.secret }
-            : {}),
-        },
-      ),
-    });
+    installed.push({ provider, resolve });
   }
 
   return { installed, timeoutSeconds };
@@ -464,87 +765,116 @@ export const installConfigurations = Effect.fn("OpenIdConnect.installConfigurati
 
 export const installConnectedConfigurations = Effect.fn(
   "OpenIdConnect.installConnectedConfigurations",
-)(function* <R>(input: OpenIdConnectConnectedProtocolOptions<R>) {
-  const discovery = yield* ProviderDiscovery;
-  const http = yield* captureHardenedHttp;
+)(function* <R>(
+  input: OpenIdConnectConnectedProtocolOptions<R>,
+  discoveryCache: DiscoveryCache = makeDiscoveryCache(),
+) {
+  const baseHttp = yield* HttpClient.HttpClient;
+  const fetch = yield* FetchHttpClient.Fetch;
+  const hardenedHttp = yield* captureHardenedHttp;
+  const signature = yield* Signature.Signature;
+  const digest = yield* Digest.Digest;
+  const mac = yield* Mac.Mac;
+  const clientSecrets = yield* PrivateKeyClientSecret;
   const { providers, timeoutSeconds } = yield* prepareConnectedConfigurations(input);
   const installed: InstalledConnectedProvider<R>[] = [];
 
   for (const provider of providers) {
-    let raw: Discovery.Metadata;
-    let signingKeyIssuerRequired = false;
-    let expectedTenantId: string | undefined;
-    let excludedTenantId: string | undefined;
-    let caseInsensitiveTenantId = false;
-
-    if (provider.protocol === "oidc") {
-      const discovered = yield* discovery.discover(
-        provider.issuer,
-        timeoutSeconds,
-        undefined,
-        undefined,
-      );
-
-      const isMicrosoftProfile = provider[discoveryProfile] === "microsoft";
-      const concrete = concreteEntraAuthority(discovered.metadata.issuer, isMicrosoftProfile);
-
-      raw = discovered.metadata;
-      signingKeyIssuerRequired =
-        discovered.signingKeyIssuerRequired || (concrete?.signingKeyIssuerRequired ?? false);
-      expectedTenantId = discovered.expectedTenantId ?? concrete?.tenantId;
-      excludedTenantId = discovered.excludedTenantId;
-      caseInsensitiveTenantId = isKnownEntraAuthority(
-        discovered.metadata.issuer,
-        isMicrosoftProfile,
-      );
-    } else {
-      raw = {
-        issuer: provider.issuer,
-        authorization_endpoint: provider.authorizationEndpoint,
-        token_endpoint: provider.tokenEndpoint,
-        response_types_supported: ["code"],
-        ...(provider.pkceS256 ? { code_challenge_methods_supported: ["S256"] } : {}),
-        authorization_response_iss_parameter_supported: provider.responseIssuerMode === "required",
-        ...(provider.revocation.mode === "rfc7009"
-          ? { revocation_endpoint: provider.revocation.endpoint }
-          : {}),
-      };
-    }
-
-    const entry = yield* installConnectedProvider(provider, raw, timeoutSeconds);
-
     if (provider.protocol !== "oidc") {
-      installed.push(entry);
+      const resolved = yield* installConnectedProvider(
+        provider,
+        {
+          issuer: provider.issuer,
+          authorization_endpoint: provider.authorizationEndpoint,
+          token_endpoint: provider.tokenEndpoint,
+          response_types_supported: ["code"],
+          ...(provider.pkceS256 ? { code_challenge_methods_supported: ["S256"] } : {}),
+          authorization_response_iss_parameter_supported:
+            provider.responseIssuerMode === "required",
+          ...(provider.revocation.mode === "rfc7009"
+            ? { revocation_endpoint: provider.revocation.endpoint }
+            : {}),
+        },
+        timeoutSeconds,
+      );
+
+      installed.push({ provider, resolve: Effect.succeed(resolved) });
       continue;
     }
 
-    const localDiscovery = yield* Discovery.makeLocal(entry.metadata).pipe(
-      Effect.catchCause((cause) =>
-        Effect.failCause(Cause.map(cause, classifyOAuthConfigurationError)),
-      ),
+    const clientAuth = nativeAuthentication(provider.authentication, clientSecrets);
+
+    const revocationAuth =
+      provider.revocation.mode === "rfc7009"
+        ? nativeAuthentication(provider.revocation.authentication, clientSecrets)
+        : undefined;
+
+    const sharedDiscovery = yield* getSharedDiscovery(discoveryCache, {
+      issuer: provider.issuer,
+      timeoutSeconds,
+      metadataUrl: discoveryMetadataUrl(provider[discoveryProfile]),
+      profile: provider[discoveryProfile],
+    });
+
+    const { resolve } = yield* makeLazyResolved<ResolvedConnectedProvider<R>>(
+      sharedDiscovery,
+      Effect.fnUntraced(function* (metadata, policy) {
+        const validated = yield* validateConnectedProviderMetadata(provider, metadata);
+
+        // Bind client, verifier, and UserInfo discovery to this registration's
+        // immutable validated snapshot.
+        const localDiscovery = yield* Discovery.makeLocal(validated).pipe(
+          Effect.catchCause((cause) =>
+            Effect.failCause(Cause.map(cause, classifyOAuthConfigurationError)),
+          ),
+        );
+
+        const client = yield* OAuth.make({
+          clientId: provider.clientId,
+          clientAuth,
+          timeout: timeoutSeconds * 1000,
+          ...(revocationAuth === undefined ? {} : { revocationAuth }),
+        }).pipe(
+          Effect.provideService(Discovery.Discovery, localDiscovery),
+          Effect.provideService(HttpClient.HttpClient, baseHttp),
+          Effect.provideService(FetchHttpClient.Fetch, fetch),
+          Effect.catchCause((cause) =>
+            Effect.failCause(Cause.map(cause, classifyOAuthConfigurationError)),
+          ),
+        );
+
+        const verifier = yield* makeVerifier(
+          validated,
+          localDiscovery,
+          provider.clientId,
+          timeoutSeconds,
+          {
+            algorithms: provider.idTokenSignedResponseAlg,
+            ...policy,
+            ...(hasStaticSecret(provider.authentication)
+              ? { clientSecret: provider.authentication.secret }
+              : {}),
+          },
+        ).pipe(
+          Effect.provideService(HttpClient.HttpClient, baseHttp),
+          Effect.provideService(FetchHttpClient.Fetch, fetch),
+          Effect.provideService(Signature.Signature, signature),
+          Effect.provideService(Digest.Digest, digest),
+          Effect.provideService(Mac.Mac, mac),
+        );
+
+        return {
+          provider,
+          metadata: validated,
+          client,
+          discovery: localDiscovery,
+          http: hardenedHttp,
+          verifier,
+        };
+      }),
     );
 
-    installed.push({
-      ...entry,
-      discovery: localDiscovery,
-      http,
-      verifier: yield* makeVerifier(
-        entry.metadata,
-        localDiscovery,
-        provider.clientId,
-        timeoutSeconds,
-        {
-          algorithms: provider.idTokenSignedResponseAlg,
-          signingKeyIssuerRequired,
-          expectedTenantId,
-          excludedTenantId,
-          caseInsensitiveTenantId,
-          ...(hasStaticSecret(provider.authentication)
-            ? { clientSecret: provider.authentication.secret }
-            : {}),
-        },
-      ),
-    });
+    installed.push({ provider, resolve });
   }
 
   return { installed, timeoutSeconds };

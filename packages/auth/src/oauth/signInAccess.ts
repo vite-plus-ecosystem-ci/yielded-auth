@@ -26,6 +26,7 @@ import { OAuthConnectedPersistence } from "./OAuthConnectedPersistence";
 import { OAuthConnectedProtocol } from "./OAuthConnectedProtocol";
 import { OAuthConnectedTokenProtector } from "./OAuthConnectedTokenProtector";
 import type { OAuthProtocol } from "./OAuthProtocol";
+import type { OAuthProviderKey } from "./schema";
 import { OAuthConfigurationError, OAuthRejected, OAuthUnavailable } from "./signInErrors";
 import {
   OAuthCallbackId,
@@ -217,7 +218,19 @@ const make = Effect.fnUntraced(function* (
     }).pipe(Effect.ensuring(Effect.sync(() => wipeConnectedMaterial(projected.material))));
   });
 
-  return { profile, prepare, exchange, retain };
+  const ready = Effect.fn("OAuth.access.ready")(function* (provider: OAuthProviderKey) {
+    if (protocol.ready === undefined) return;
+
+    yield* protocol.ready({ provider });
+  });
+
+  return {
+    profile,
+    prepare,
+    ready,
+    exchange,
+    retain,
+  };
 });
 
 export type SignInAccess = Effect.Success<ReturnType<typeof make>>;

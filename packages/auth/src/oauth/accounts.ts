@@ -205,7 +205,7 @@ export const makeOAuthAccounts = <
       } = yield* OAuthAccountsPersistence;
 
       const { verify: verifyAction } = yield* OAuthActionEvidence;
-      const { prepareAuthorization, exchangeVerifiedIdentity } = yield* OAuthProtocol;
+      const { prepareAuthorization, exchangeVerifiedIdentity, ready } = yield* OAuthProtocol;
       const { resolve: resolveTarget } = yield* OAuthReturnTargets;
       const { seal, open } = yield* OAuthLinkTransactionProtector;
       const { before } = yield* LifecycleHooks;
@@ -562,6 +562,12 @@ export const makeOAuthAccounts = <
             ? { ...binding, formPostSubject: true as const }
             : { ...binding, subjectId: authenticated.subjectId },
         );
+
+        // Warm lazy provider metadata before consuming a valid code flow so a
+        // discovery outage leaves the flow pending.
+        if (response._tag === "Code" && ready !== undefined) {
+          yield* ready({ provider: request.provider, kind: "web" });
+        }
 
         const consumed = yield* consume(access, (value, journal) =>
           journal.prepare(snapshotOAuthLinkConsumeDecision.sync(value)),

@@ -734,7 +734,18 @@ against a template issuer).
 
 Sign-in accepts per-request `prompt` and `loginHint`. Public clients use
 `authentication: { method: "none", publicClient: true }`. Load secrets with
-`Config.Redacted`; invalid settings fail Layer construction.
+`Config.Redacted`. Static settings (including shared-callback issuer checks)
+validate at Layer construction with zero network I/O. OpenID Connect providers
+resolve discovery lazily on first use — including the first callback, refresh,
+or revocation after a restart. Metadata-dependent checks (issuer matching,
+advertised authentication methods, PKCE, ID-token algorithms, verifier key
+setup, and `responseIssuerMode: "discovered"`) fail with `OAuthUnavailable`
+before any pending flow is consumed, active grant is settled, or revocation job
+is claimed (one IdP outage delays revocation maintenance for that installation
+until recovery); metadata-dependent configuration failures do not block startup. Run
+`yield* ((yield* OAuthProtocol).ready?.() ?? Effect.void)` (and
+`yield* ((yield* OAuthConnectedProtocol).ready?.() ?? Effect.void)` for
+connected grants) during startup when fail-fast boot validation is required.
 
 ### Configuration rotation
 

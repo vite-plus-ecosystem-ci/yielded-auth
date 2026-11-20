@@ -914,11 +914,14 @@ it.effect.each<EntraDiscoveryCase>([
         const { keyIssuer, accepted } = entry;
         const tokenTid = "tid" in entry && entry.tid !== undefined ? entry.tid : tid;
         let idToken = "";
+        let discoveryCalls = 0;
 
         const fetch: typeof globalThis.fetch = async (input) => {
           const url = input instanceof Request ? input.url : String(input);
 
           if (url === endpoints.discovery) {
+            discoveryCalls++;
+
             return json({
               issuer: discoveryIssuer,
               ...(v1 ? {} : { signing_key_issuer_required: false }),
@@ -966,10 +969,14 @@ it.effect.each<EntraDiscoveryCase>([
           ],
         }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch));
 
+        expect(discoveryCalls).toBe(0);
+
         const started = yield* protocol.prepareAuthorization({
           provider: OAuthProviderKey.make("entra"),
           flowId: RequestBindingFlowId.make("flow-entra"),
         });
+
+        expect(discoveryCalls).toBe(1);
 
         if (started.secrets.oidcNonce === undefined) {
           throw new Error("Expected OIDC nonce");
@@ -1095,4 +1102,91 @@ it.effect(
         },
       ]);
     }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
+);
+
+// Regression from c4752e3 (Effect-TS/effect#9884): eager startup discovery failed
+// Layer construction whenever an OIDC IdP was unavailable at boot.
+it.effect(
+  "defers OIDC discovery past Layer startup when the IdP is down and recovers after cooldown",
+  () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(2_000_000_000_000);
+
+      const issuer = "https://lazy-idp.example";
+      const discoveryUrl = `${issuer}/.well-known/openid-configuration`;
+      let mode: "down" | "hs256-unusable" | "healthy" = "down";
+      let discoveryCalls = 0;
+
+      const fetch: typeof globalThis.fetch = async (input) => {
+        const url = input instanceof Request ? input.url : String(input);
+
+        if (url === discoveryUrl) {
+          discoveryCalls++;
+          if (mode === "down") return new Response("service unavailable", { status: 503 });
+
+          return json({
+            issuer,
+            authorization_endpoint: `${issuer}/authorize`,
+            token_endpoint: `${issuer}/token`,
+            jwks_uri: `${issuer}/jwks`,
+            response_types_supported: ["code"],
+            code_challenge_methods_supported: ["S256"],
+            id_token_signing_alg_values_supported:
+              mode === "hs256-unusable" ? ["HS256"] : ["ES256"],
+            token_endpoint_auth_methods_supported: ["client_secret_basic"],
+            authorization_response_iss_parameter_supported: true,
+          });
+        }
+        throw new Error(`Unexpected endpoint ${url}`);
+      };
+
+      const protocol = yield* loadProtocol({
+        providers: [
+          {
+            protocol: "oidc",
+            provider: OAuthProviderKey.make("lazy"),
+            issuer: OAuthIssuer.make(issuer),
+            responseIssuerMode: "discovered",
+            clientId: "client",
+            clientSecret: Redacted.make("short"),
+            redirectUri: OAuthRedirectUri.make("https://app.test/auth/lazy/callback"),
+            idTokenSignedResponseAlg: ["HS256", "ES256"],
+          },
+        ],
+      }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch));
+
+      expect(discoveryCalls).toBe(0);
+
+      const prepare = () =>
+        protocol.prepareAuthorization({
+          provider: OAuthProviderKey.make("lazy"),
+          flowId: RequestBindingFlowId.make("flow-lazy"),
+        });
+
+      yield* expectTag(prepare(), "OAuthUnavailable");
+      expect(discoveryCalls).toBe(1);
+
+      // Cooldown prevents immediate refetch; unusable HS256 verifier setup does not pin metadata.
+      mode = "hs256-unusable";
+      yield* TestClock.adjust("5 seconds");
+      yield* expectTag(prepare(), "OAuthUnavailable");
+      expect(discoveryCalls).toBe(1);
+
+      yield* TestClock.adjust("26 seconds");
+      yield* expectTag(prepare(), "OAuthUnavailable");
+      expect(discoveryCalls).toBe(2);
+
+      mode = "healthy";
+      yield* TestClock.adjust("31 seconds");
+      yield* protocol.ready?.() ?? Effect.void;
+      expect(discoveryCalls).toBe(3);
+
+      const started = yield* prepare();
+
+      expect(discoveryCalls).toBe(3);
+      expect(started.configuration.responseIssuerMode).toBe("required");
+
+      yield* prepare();
+      expect(discoveryCalls).toBe(3);
+    }).pipe(Effect.provide(platform)),
 );

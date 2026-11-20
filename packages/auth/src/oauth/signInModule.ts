@@ -461,6 +461,7 @@ export const makeOAuthMethod = <
           exchangeVerifiedIdentity,
           prepareNative,
           verifyNativeIdentity,
+          ready,
         } = yield* OAuthProtocol;
 
         const { resolve: returnTarget } = yield* OAuthReturnTargets;
@@ -896,20 +897,31 @@ export const makeOAuthMethod = <
 
             const state = yield* stateDigest(request.flowId, request.provider, response.state);
 
-            const decision = yield* consume(
-              {
-                moduleId: id,
-                generation: policy.generation,
-                flowId: request.flowId,
-                provider: request.provider,
-                callbackId: request.callbackId,
-                stateDigest: state,
-                requestBindingVerifier: binder.verifier,
-                requestBindingExpiresAtMillis: binder.expiresAtMillis,
-                responseMode: observedMode,
-                ...(response.issuer === undefined ? {} : { responseIssuer: response.issuer }),
-              },
-              (value, journal) => journal.prepare(snapshotOAuthConsumeDecision.sync(value)),
+            const accessInput = {
+              moduleId: id,
+              generation: policy.generation,
+              flowId: request.flowId,
+              provider: request.provider,
+              callbackId: request.callbackId,
+              stateDigest: state,
+              requestBindingVerifier: binder.verifier,
+              requestBindingExpiresAtMillis: binder.expiresAtMillis,
+              responseMode: observedMode,
+              ...(response.issuer === undefined ? {} : { responseIssuer: response.issuer }),
+            };
+
+            // Warm lazy provider metadata before consuming a valid code flow so a
+            // discovery outage leaves the flow pending.
+            if (response._tag === "Code") {
+              if (access !== undefined) {
+                yield* access.ready(request.provider);
+              } else if (ready !== undefined) {
+                yield* ready({ provider: request.provider, kind: "web" });
+              }
+            }
+
+            const decision = yield* consume(accessInput, (value, journal) =>
+              journal.prepare(snapshotOAuthConsumeDecision.sync(value)),
             ).pipe(Effect.flatMap(read));
 
             if (decision._tag !== "Consumed") return yield* OAuthRejected.make({});
@@ -1048,18 +1060,23 @@ export const makeOAuthMethod = <
               binder.verifier,
             );
 
-            const decision = yield* consume(
-              {
-                moduleId: id,
-                generation: policy.generation,
-                flowId: request.flowId,
-                provider: request.provider,
-                callbackId: OAuthNativeCallbackId,
-                stateDigest: state,
-                requestBindingVerifier: binder.verifier,
-                requestBindingExpiresAtMillis: binder.expiresAtMillis,
-              },
-              (value, journal) => journal.prepare(snapshotOAuthConsumeDecision.sync(value)),
+            const nativeAccess = {
+              moduleId: id,
+              generation: policy.generation,
+              flowId: request.flowId,
+              provider: request.provider,
+              callbackId: OAuthNativeCallbackId,
+              stateDigest: state,
+              requestBindingVerifier: binder.verifier,
+              requestBindingExpiresAtMillis: binder.expiresAtMillis,
+            };
+
+            if (ready !== undefined) {
+              yield* ready({ provider: request.provider, kind: "native" });
+            }
+
+            const decision = yield* consume(nativeAccess, (value, journal) =>
+              journal.prepare(snapshotOAuthConsumeDecision.sync(value)),
             ).pipe(Effect.flatMap(read));
 
             if (decision._tag !== "Consumed") return yield* OAuthRejected.make({});

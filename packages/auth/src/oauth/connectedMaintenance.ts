@@ -79,7 +79,7 @@ export const makeOAuthConnectedMaintenance = <const Id extends string>(
       const { id, policy } = yield* validateConnectedPolicy(moduleId, captured);
       const { cleanup: clean } = yield* OAuthConnectedPersistence;
       const revocations = yield* Effect.serviceOption(OAuthConnectedRevocations);
-      const { revokeGrant } = yield* OAuthConnectedProtocol;
+      const { revokeGrant, ready } = yield* OAuthConnectedProtocol;
       const { open } = yield* OAuthConnectedTokenProtector;
       const { randomBytes } = yield* SecureRandom.SecureRandom;
 
@@ -116,6 +116,11 @@ export const makeOAuthConnectedMaintenance = <const Id extends string>(
       ) {
         yield* authorize(invocation);
         if (Option.isNone(revocations)) return yield* OAuthMethodUnsupported.make({});
+
+        if (ready !== undefined) {
+          yield* ready();
+        }
+
         const { claim, settle } = revocations.value;
 
         const bytes = yield* randomBytes(32).pipe(

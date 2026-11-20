@@ -165,7 +165,7 @@ export const makeOAuthConnected = <const Id extends string>(
 
       const { verify: verifyAction } = yield* OAuthConnectedActionEvidence;
       const { authorize: authorizeUse } = yield* OAuthConnectedUseAuthority;
-      const { prepareAuthorization, exchangeGrant } = yield* OAuthConnectedProtocol;
+      const { prepareAuthorization, exchangeGrant, ready } = yield* OAuthConnectedProtocol;
       const { seal: sealFlow, open: openFlow } = yield* OAuthConnectedTransactionProtector;
       const { seal: sealTokens } = yield* OAuthConnectedTokenProtector;
       const { resolve: resolveTarget } = yield* OAuthReturnTargets;
@@ -550,6 +550,12 @@ export const makeOAuthConnected = <const Id extends string>(
             ? { ...binding, formPostSubject: true as const }
             : { ...binding, subjectId: authenticated.subjectId },
         );
+
+        // Warm lazy provider metadata before consuming a valid code flow so a
+        // discovery outage leaves the flow pending.
+        if (response._tag === "Code" && ready !== undefined) {
+          yield* ready({ provider: request.provider });
+        }
 
         const consumed = yield* consume(access, (value, journal) =>
           journal.prepare(snapshotOAuthConnectedConsumeDecision.sync(value)),
